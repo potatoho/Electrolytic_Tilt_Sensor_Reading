@@ -31,16 +31,32 @@
 #define DRDY_TIMEOUT_US      250U
 #define PWM_EDGE_TIMEOUT_US 3000U
 #define REPORT_INTERVAL_US   1000000ULL
+
 #define LPF_TAU_SECONDS       5.0
 
-/* Temporary glitch rejection before the 5 s LPF.
- * A 1-second averaged VDIFF value that differs from the last accepted value
- * by more than JUMP_REJECT_THRESHOLD_UV is held.
- * If the out-of-range change persists in the same direction for
- * JUMP_REJECT_PERSIST_COUNT consecutive reports, the new value is accepted.
+/*
+ * Motion-aware spike guard applied to the 1 s averaged VDIFF before
+ * the existing 5 s LPF.
+ *
+ * Jump candidate threshold:
+ *   |raw - guarded| > 350 uV
+ *
+ * 8-point (~8 s) trend:
+ *   motion is accepted only when linear slope and net displacement
+ *   have the same direction as the current deviation.
+ *
+ * Direction-dependent slew limits use about 2x the maximum measured
+ * post-LPF motion speed.
  */
-#define JUMP_REJECT_THRESHOLD_UV   500.0
-#define JUMP_REJECT_PERSIST_COUNT  3U
+#define GUARD_WINDOW_SIZE              8U
+#define GUARD_JUMP_THRESHOLD_UV      350.0
+#define GUARD_MIN_SLOPE_UV_PER_S      50.0
+#define GUARD_MIN_NET_CHANGE_UV       300.0
+
+#define CH1_GUARD_MAX_FALL_UV_PER_S   250.0
+#define CH1_GUARD_MAX_RISE_UV_PER_S   100.0
+#define CH2_GUARD_MAX_FALL_UV_PER_S   350.0
+#define CH2_GUARD_MAX_RISE_UV_PER_S   200.0
 
 #define TCP_MAX_CLIENTS        8
 #define TCP_RX_BUFFER_SIZE    128
@@ -130,10 +146,13 @@ struct channel_state {
     uint32_t sample_count;
 };
 
-struct jump_reject_state {
-    double accepted_uv;
-    unsigned int candidate_count;
-    int candidate_direction;
+struct guard_state {
+    double corrected_uv;
+    double lpf_uv;
+    double history_uv[GUARD_WINDOW_SIZE];
+    double history_t[GUARD_WINDOW_SIZE];
+    unsigned int history_count;
+    unsigned int history_pos;
     int initialized;
 };
 
@@ -754,70 +773,6 @@ static void reset_channel_average(
     channel->sample_count = 0;
 }
 
-static double apply_jump_rejection(
-    struct jump_reject_state *state,
-    double input_uv,
-    const char *channel_name)
-{
-    if (!state->initialized) {
-        state->accepted_uv = input_uv;
-        state->candidate_count = 0U;
-        state->candidate_direction = 0;
-        state->initialized = 1;
-        return input_uv;
-    }
-
-    double delta_uv = input_uv - state->accepted_uv;
-
-    if (delta_uv <= JUMP_REJECT_THRESHOLD_UV &&
-        delta_uv >= -JUMP_REJECT_THRESHOLD_UV) {
-        state->accepted_uv = input_uv;
-        state->candidate_count = 0U;
-        state->candidate_direction = 0;
-        return input_uv;
-    }
-
-    int direction = delta_uv > 0.0 ? 1 : -1;
-
-    if (state->candidate_direction == direction) {
-        state->candidate_count++;
-    } else {
-        state->candidate_direction = direction;
-        state->candidate_count = 1U;
-    }
-
-    if (state->candidate_count >= JUMP_REJECT_PERSIST_COUNT) {
-        fprintf(
-            stderr,
-            "%s jump accepted after %u consecutive reports: "
-            "old=%.1f uV, new=%.1f uV, delta=%+.1f uV\n",
-            channel_name,
-            state->candidate_count,
-            state->accepted_uv,
-            input_uv,
-            delta_uv
-        );
-
-        state->accepted_uv = input_uv;
-        state->candidate_count = 0U;
-        state->candidate_direction = 0;
-        return input_uv;
-    }
-
-    fprintf(
-        stderr,
-        "%s jump held (%u/%u): input=%.1f uV, held=%.1f uV, delta=%+.1f uV\n",
-        channel_name,
-        state->candidate_count,
-        JUMP_REJECT_PERSIST_COUNT,
-        input_uv,
-        state->accepted_uv,
-        delta_uv
-    );
-
-    return state->accepted_uv;
-}
-
 static int32_t code_to_uv(int64_t code)
 {
     int64_t uv =
@@ -868,6 +823,140 @@ static double fit_angle_mdeg(double t)
              - 1.15097020e-5) * t
             + 0.916180507) * t
            - 0.568154573;
+}
+
+static double clamp_double(double value, double low, double high)
+{
+    if (value < low)
+        return low;
+    if (value > high)
+        return high;
+    return value;
+}
+
+static int same_sign_nonzero(double a, double b)
+{
+    return (a > 0.0 && b > 0.0) || (a < 0.0 && b < 0.0);
+}
+
+static void guard_push_history(
+    struct guard_state *state,
+    double time_s,
+    double raw_uv)
+{
+    state->history_uv[state->history_pos] = raw_uv;
+    state->history_t[state->history_pos] = time_s;
+    state->history_pos = (state->history_pos + 1U) % GUARD_WINDOW_SIZE;
+
+    if (state->history_count < GUARD_WINDOW_SIZE)
+        state->history_count++;
+}
+
+static int guard_linear_trend(
+    const struct guard_state *state,
+    double *slope_uv_per_s,
+    double *net_uv)
+{
+    if (state->history_count < GUARD_WINDOW_SIZE) {
+        *slope_uv_per_s = 0.0;
+        *net_uv = 0.0;
+        return 0;
+    }
+
+    unsigned int first = state->history_pos;
+    double sum_t = 0.0;
+    double sum_y = 0.0;
+
+    for (unsigned int i = 0; i < GUARD_WINDOW_SIZE; ++i) {
+        unsigned int idx = (first + i) % GUARD_WINDOW_SIZE;
+        sum_t += state->history_t[idx];
+        sum_y += state->history_uv[idx];
+    }
+
+    double mean_t = sum_t / (double)GUARD_WINDOW_SIZE;
+    double mean_y = sum_y / (double)GUARD_WINDOW_SIZE;
+    double num = 0.0;
+    double den = 0.0;
+
+    for (unsigned int i = 0; i < GUARD_WINDOW_SIZE; ++i) {
+        unsigned int idx = (first + i) % GUARD_WINDOW_SIZE;
+        double dt_local = state->history_t[idx] - mean_t;
+        double dy = state->history_uv[idx] - mean_y;
+        num += dt_local * dy;
+        den += dt_local * dt_local;
+    }
+
+    if (den <= 0.0) {
+        *slope_uv_per_s = 0.0;
+        *net_uv = 0.0;
+        return 0;
+    }
+
+    unsigned int last =
+        (state->history_pos + GUARD_WINDOW_SIZE - 1U) % GUARD_WINDOW_SIZE;
+
+    *slope_uv_per_s = num / den;
+    *net_uv = state->history_uv[last] - state->history_uv[first];
+
+    return 1;
+}
+
+static double guard_update(
+    struct guard_state *state,
+    double time_s,
+    double raw_uv,
+    double dt,
+    double max_fall_uv_per_s,
+    double max_rise_uv_per_s)
+{
+    if (dt <= 0.0)
+        dt = 1.0;
+
+    if (!state->initialized) {
+        state->corrected_uv = raw_uv;
+        state->lpf_uv = raw_uv;
+        state->initialized = 1;
+        guard_push_history(state, time_s, raw_uv);
+        return state->corrected_uv;
+    }
+
+    guard_push_history(state, time_s, raw_uv);
+
+    double slope_uv_per_s = 0.0;
+    double net_uv = 0.0;
+    int have_trend =
+        guard_linear_trend(state, &slope_uv_per_s, &net_uv);
+
+    double delta_uv = raw_uv - state->corrected_uv;
+    int allow_follow = 1;
+
+    if (delta_uv > GUARD_JUMP_THRESHOLD_UV ||
+        delta_uv < -GUARD_JUMP_THRESHOLD_UV) {
+        int trend_is_motion =
+            have_trend &&
+            (slope_uv_per_s >= GUARD_MIN_SLOPE_UV_PER_S ||
+             slope_uv_per_s <= -GUARD_MIN_SLOPE_UV_PER_S) &&
+            (net_uv >= GUARD_MIN_NET_CHANGE_UV ||
+             net_uv <= -GUARD_MIN_NET_CHANGE_UV) &&
+            same_sign_nonzero(slope_uv_per_s, net_uv) &&
+            same_sign_nonzero(slope_uv_per_s, delta_uv);
+
+        if (!trend_is_motion)
+            allow_follow = 0;
+    }
+
+    if (allow_follow) {
+        double max_fall_step_uv = max_fall_uv_per_s * dt;
+        double max_rise_step_uv = max_rise_uv_per_s * dt;
+        double step_uv = clamp_double(
+            delta_uv,
+            -max_fall_step_uv,
+            max_rise_step_uv);
+
+        state->corrected_uv += step_uv;
+    }
+
+    return state->corrected_uv;
 }
 
 static int open_tcp_server(uint16_t port)
@@ -1239,13 +1328,7 @@ int main(int argc, char **argv)
     uint64_t pwm_epoch = 0;
     uint64_t missed_cycles = 0;
     unsigned int warmup_cycles = 20U;
-    double ch1_vdiff_lpf_uv = 0.0;
-    double ch2_vdiff_lpf_uv = 0.0;
-    struct jump_reject_state ch1_jump = {0};
-    struct jump_reject_state ch2_jump = {0};
-    double board_temp_lpf_mC = -1.0;
-    int lpf_initialized = 0;
-    int temp_lpf_initialized = 0;
+    struct guard_state guard[2] = {0};
 
     if (retry_ads_select_channel(selected_channel) < 0)
         return EXIT_FAILURE;
@@ -1259,14 +1342,6 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "GPIO18/GPIO19 hardware PWM: 1 kHz complementary, "
             "ADC synchronized to GPIO18 edges\n");
-
-    puts(
-        "time,Temp_raw_mC,Temp_LPF_mC,"
-        "CH1_HIGH_raw,CH1_LOW_raw,CH1_VDIFF_raw_uV,"
-        "CH1_VDIFF_mdeg,CH1_LPF_fitted_mdeg,CH1_LPF_fitted_mdeg_offset,"
-        "CH2_HIGH_raw,CH2_LOW_raw,CH2_VDIFF_raw_uV,"
-        "CH2_VDIFF_mdeg,CH2_LPF_fitted_mdeg,CH2_LPF_fitted_mdeg_offset"
-    );
 
     while (running) {
     int valid_high = 0;
@@ -1297,8 +1372,8 @@ int main(int argc, char **argv)
      * HIGH phase
      */
     /*
-     * MUX 책 챙�뮤셌モ�앪�┚ヂ뼘뼙� 챙탐�왗р�샕�ㅒ뼘Γ�온� 책 챙탐흸챘짰�왗ⓥ궗흸챙��뮨�쒋꽓책 챦쩔쩍 챌짯흸챙큄�샖�쒋꽓책 챙탐�왗�궗징챌�씲궁ぢ뮨�쒋꽓책 챦쩔쩍 책 챙�▣�쒋꽓 책 챙탐�챘흹�졗�온시р�◈꼴�꿎�뮨� 챙쨍챙�붌� 챦쩔쩍
-     * HIGH phase 책 챙탐흸챘짰�왗ⓥ궗흸챙��뮨�쒋꽓책 챦쩔쩍 책 챙탐�왗р�샕늘�온시�온� 책 챙탐흸챘짰�≥�온시ヂㅒ뼙ぢ꼲ッ� 챙�▣�쒋꽓책 챦쩔쩍 책 챙짭챘�걘�온시�온� 챦쩔쩍창�샕Ｃр�샕늘┑꿎�┚р�걘�쒋꽓챦쩔쩍챘쨘짙챘쩌��.
+     * MUX 책 챙 뮤셌モ 앪 ┚ヂ뼘뼙  챙탐 왗р 샕 ㅒ뼘Γ 온  책 챙탐흸챘짰 왗ⓥ궗흸챙  뮨 쒋꽓책 챦쩔쩍 챌짯흸챙큄 샖 쒋꽓책 챙탐 왗 궗징챌 씲궁ぢ뮨 쒋꽓책 챦쩔쩍 책 챙 ▣ 쒋꽓 책 챙탐 챘흹 졗 온시р ◈꼴 꿎 뮨  챙쨍챙 붌  챦쩔쩍
+     * HIGH phase 책 챙탐흸챘짰 왗ⓥ궗흸챙  뮨 쒋꽓책 챦쩔쩍 책 챙탐 왗р 샕늘 온시 온  책 챙탐흸챘짰 ≥ 온시ヂㅒ뼙ぢ꼲ッ  챙 ▣ 쒋꽓책 챦쩔쩍 책 챙짭챘 걘 온시 온  챦쩔쩍창 샕Ｃр 샕늘┑꿎 ┚р 걘 쒋꽓챦쩔쩍챘쨘짙챘쩌  .
      */
     sleep_until_us(
         rising_edge + EXTERNAL_SETTLING_US
@@ -1344,8 +1419,8 @@ int main(int argc, char **argv)
         break;
 
     /*
-     * HIGH책 챙�▣�쒋꽓 LOW챈쨋챙�걘�쒋꽓 챌짯흸챘짚쨈챘짬���㎴�온� 책 챙탐�챘짼징챈쨔짼챙�▣�쒋꽓책 챦쩔쩍 책 챙탐�챙힋짖책쩍�봤�온�
-     * 1챦쩔쩍횓쩔챙��� 책 챙탐�왗�궗짙챦쩔쩍챙짖�샖�쒋꽓챦쩔쩍챦쩔쩍챘�≤� 책 챙탐�왗р�샕늘�온시р�슿셌�쒋꽓책 챦쩔쩍 책 챙�뮤셌モ�붋ッヂ㎮꽓책 챙탐흸챘짰�졗�온시�온�.
+     * HIGH책 챙 ▣ 쒋꽓 LOW챈쨋챙 걘 쒋꽓 챌짯흸챘짚쨈챘짬   ㎴ 온  책 챙탐 챘짼징챈쨔짼챙 ▣ 쒋꽓책 챦쩔쩍 책 챙탐 챙힋짖책쩍 봤 온 
+     * 1챦쩔쩍횓쩔챙    책 챙탐 왗 궗짙챦쩔쩍챙짖 샖 쒋꽓챦쩔쩍챦쩔쩍챘 ≤  책 챙탐 왗р 샕늘 온시р 슿셌 쒋꽓책 챦쩔쩍 책 챙 뮤셌モ 붋ッヂ㎮꽓책 챙탐흸챘짰 졗 온시 온 .
      */
     if (warmup_cycles > 0U) {
         warmup_cycles--;
@@ -1354,8 +1429,8 @@ int main(int argc, char **argv)
     }
 
     /*
-     * 책 챙탐�왗р�샕��온시ヂ���쒋꽓챌�™�쇒�온시ヂ��� 챌짯흸챙큄힋챘�슿��온시�온� 책 챙탐�왗р�샕늘㎶뮻올�온� 챦쩔쩍챗쩐짢챘�붴궗챔짬짯챘째챙��▣� 챦쩔쩍
-     * 1챦쩔쩍횓쩔챙��� 책 챙탐�챘짠짝챦쩔쩍챦쩔쩍 챦쩔쩍창�샕Ｃр�샕늘┑꿎�┚�온� 챌�왗р�걘�쒋꽓 UDP 책 챙탐�왗р�샕늘�온시�온� 챦쩔쩍챘쨍챙��▣�온시ヂ매뮼р�샕늘�온시�온� 책타타챘째쨍챙짹쨋책 챙쨍챙�붌� 챦쩔쩍 책 챙탐�챘�붴궗챦쩔쩍챦쩔쩍.
+     * 책 챙탐 왗р 샕  온시ヂ   쒋꽓챌 ™ 쇒 온시ヂ    챌짯흸챙큄힋챘 슿  온시 온  책 챙탐 왗р 샕늘㎶뮻올 온  챦쩔쩍챗쩐짢챘 붴궗챔짬짯챘째챙  ▣  챦쩔쩍
+     * 1챦쩔쩍횓쩔챙    책 챙탐 챘짠짝챦쩔쩍챦쩔쩍 챦쩔쩍창 샕Ｃр 샕늘┑꿎 ┚ 온  챌 왗р 걘 쒋꽓 UDP 책 챙탐 왗р 샕늘 온시 온  챦쩔쩍챘쨍챙  ▣ 온시ヂ매뮼р 샕늘 온시 온  책타타챘째쨍챙짹쨋책 챙쨍챙 붌  챦쩔쩍 책 챙탐 챘 붴궗챦쩔쩍챦쩔쩍.
      */
 
         uint64_t now = monotonic_us();
@@ -1375,20 +1450,8 @@ int main(int argc, char **argv)
         uint32_t ch2_count =
             channels[1].sample_count;
 
-        int64_t ch1_high_avg =
-            channels[0].high_sum / ch1_count;
-
-        int64_t ch1_low_avg =
-            channels[0].low_sum / ch1_count;
-
         int64_t ch1_vdiff_avg =
             channels[0].vdiff_sum / ch1_count;
-
-        int64_t ch2_high_avg =
-            channels[1].high_sum / ch2_count;
-
-        int64_t ch2_low_avg =
-            channels[1].low_sum / ch2_count;
 
         int64_t ch2_vdiff_avg =
             channels[1].vdiff_sum / ch2_count;
@@ -1399,104 +1462,55 @@ int main(int argc, char **argv)
         int32_t ch2_vdiff_uv =
             code_to_uv(ch2_vdiff_avg);
 
-        double ch1_angle_mdeg =
-            ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
-
-        double ch2_angle_mdeg =
-            ch2_vdiff_uv / SENSOR_UV_PER_MDEG;
-
         double dt =
             (double)(now - last_report) / 1000000.0;
-
-        /*
-         * Keep the CSV raw VDIFF values unchanged for diagnostics.
-         * Only the signal entering the 5 s LPF is jump-rejected.
-         */
-        double ch1_guarded_uv =
-            apply_jump_rejection(&ch1_jump, (double)ch1_vdiff_uv, "CH1");
-
-        double ch2_guarded_uv =
-            apply_jump_rejection(&ch2_jump, (double)ch2_vdiff_uv, "CH2");
-
-        if (!lpf_initialized) {
-            ch1_vdiff_lpf_uv = ch1_guarded_uv;
-            ch2_vdiff_lpf_uv = ch2_guarded_uv;
-            lpf_initialized = 1;
-        } else {
-            double alpha = dt / (LPF_TAU_SECONDS + dt);
-
-            ch1_vdiff_lpf_uv +=
-                alpha * (ch1_guarded_uv - ch1_vdiff_lpf_uv);
-            ch2_vdiff_lpf_uv +=
-                alpha * (ch2_guarded_uv - ch2_vdiff_lpf_uv);
-        }
-
-        double ch1_lpf_input_mdeg =
-            ch1_vdiff_lpf_uv / SENSOR_UV_PER_MDEG;
-
-        double ch2_lpf_input_mdeg =
-            ch2_vdiff_lpf_uv / SENSOR_UV_PER_MDEG;
-
-        double ch1_lpf_mdeg =
-            fit_angle_mdeg(ch1_lpf_input_mdeg);
-
-        double ch2_lpf_mdeg =
-            fit_angle_mdeg(ch2_lpf_input_mdeg);
-
-        double ch1_lpf_mdeg_offset =
-            ch1_lpf_mdeg + offset_ch1;
-
-        double ch2_lpf_mdeg_offset =
-            ch2_lpf_mdeg + offset_ch2;
 
         double elapsed_time_s =
             (double)(now - pwm_epoch) / 1000000.0;
 
-        int board_temp_mC = read_board_temp_mC();
-
-        if (board_temp_mC >= 0) {
-            if (!temp_lpf_initialized) {
-                board_temp_lpf_mC = (double)board_temp_mC;
-                temp_lpf_initialized = 1;
-            } else {
-                double alpha = dt / (LPF_TAU_SECONDS + dt);
-
-                board_temp_lpf_mC +=
-                    alpha *
-                    ((double)board_temp_mC - board_temp_lpf_mC);
-            }
-        }
-
-        char console_message[448];
-
-        int console_length = snprintf(
-            console_message,
-            sizeof(console_message),
-            "%.3f,%d,%.1f,"
-            "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
-            "%lld,%lld,%ld,%.3f,%.3f,%.3f\n",
-
+        double ch1_guard_vdiff_uv = guard_update(
+            &guard[0],
             elapsed_time_s,
-            board_temp_mC,
-            temp_lpf_initialized ? board_temp_lpf_mC : -1.0,
-
-            (long long)ch1_high_avg,
-            (long long)ch1_low_avg,
-            (long)ch1_vdiff_uv,
-            ch1_angle_mdeg,
-            ch1_lpf_mdeg,
-            ch1_lpf_mdeg_offset,
-
-            (long long)ch2_high_avg,
-            (long long)ch2_low_avg,
-            (long)ch2_vdiff_uv,
-            ch2_angle_mdeg,
-            ch2_lpf_mdeg,
-            ch2_lpf_mdeg_offset
+            (double)ch1_vdiff_uv,
+            dt,
+            CH1_GUARD_MAX_FALL_UV_PER_S,
+            CH1_GUARD_MAX_RISE_UV_PER_S
         );
 
-        (void)console_length;
+        double ch2_guard_vdiff_uv = guard_update(
+            &guard[1],
+            elapsed_time_s,
+            (double)ch2_vdiff_uv,
+            dt,
+            CH2_GUARD_MAX_FALL_UV_PER_S,
+            CH2_GUARD_MAX_RISE_UV_PER_S
+        );
 
+        /*
+         * Existing 5 s LPF now receives only the guarded VDIFF.
+         * These are the final voltage values returned by #vol?.
+         */
+        double alpha = dt / (LPF_TAU_SECONDS + dt);
+
+        guard[0].lpf_uv +=
+            alpha * (ch1_guard_vdiff_uv - guard[0].lpf_uv);
+
+        guard[1].lpf_uv +=
+            alpha * (ch2_guard_vdiff_uv - guard[1].lpf_uv);
+
+        /*
+         * Existing calibration and offsets are applied after the guarded LPF.
+         * These are the final angle values returned by #deg?.
+         */
+        double ch1_lpf_mdeg_offset =
+            fit_angle_mdeg(
+                guard[0].lpf_uv / SENSOR_UV_PER_MDEG
+            ) + offset_ch1;
+
+        double ch2_lpf_mdeg_offset =
+            fit_angle_mdeg(
+                guard[1].lpf_uv / SENSOR_UV_PER_MDEG
+            ) + offset_ch2;
 
         if (tcp_server_fd >= 0) {
             service_tcp_clients(
@@ -1504,18 +1518,10 @@ int main(int argc, char **argv)
                 tcp_clients,
                 ch1_lpf_mdeg_offset,
                 ch2_lpf_mdeg_offset,
-                ch1_vdiff_lpf_uv,
-                ch2_vdiff_lpf_uv
+                guard[0].lpf_uv,
+                guard[1].lpf_uv
             );
         }
-
-        fprintf(
-            stderr,
-            "averaged samples: CH1=%u, CH2=%u, skipped ADC cycles=%llu\n",
-            ch1_count,
-            ch2_count,
-            (unsigned long long)missed_cycles
-        );
 
         missed_cycles = 0;
 
