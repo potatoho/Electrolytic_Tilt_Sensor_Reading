@@ -1,0 +1,1512 @@
+#define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/gpio.h>
+#include <linux/spi/spidev.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define GPIO_CHIP          "/dev/gpiochip0"
+#define GPIO_ADC_CS1       22U
+#define GPIO_ADC_CS2       23U
+#define GPIO_ADC_DRDY      24U
+
+#define SPI_DEVICE         "/dev/spidev0.0"
+#define SPI_SPEED_HZ       8000000U
+
+#define PWM_PERIOD_US       1000ULL
+#define HALF_PERIOD_US       500ULL
+#define EXTERNAL_SETTLING_US 200U
+#define DRDY_TIMEOUT_US      250U
+#define ADS_RESET_SETTLE_US  200U
+#define SAMPLE_PHASE_GUARD_US 40ULL
+#define PWM_EDGE_TIMEOUT_US 3000U
+#define REPORT_INTERVAL_US   1000000ULL
+#define LPF_TAU_SECONDS       5.0
+
+/* Raspberry Pi 3 / BCM2837 peripheral addresses. */
+#define GPIO_BASE_PHYS     0x3F200000UL
+#define PWM_BASE_PHYS      0x3F20C000UL
+#define CLK_BASE_PHYS      0x3F101000UL
+#define PERIPHERAL_SIZE    4096UL
+
+#define GPFSEL1            1U
+#define GPLEV0             (0x34U / 4U)
+#define PWM_CTL            0U
+#define PWM_STA            1U
+#define PWM_RNG1           4U
+#define PWM_DAT1           5U
+#define PWM_RNG2           8U
+#define PWM_DAT2           9U
+#define CM_PWMCTL          (0xA0U / 4U)
+#define CM_PWMDIV          (0xA4U / 4U)
+
+#define CM_PASSWORD        0x5A000000U
+#define CM_CTL_SRC_OSC     0x00000001U
+#define CM_CTL_ENAB        0x00000010U
+#define CM_CTL_KILL        0x00000020U
+#define CM_CTL_BUSY        0x00000080U
+
+#define PWM_CTL_PWEN1      (1U << 0)
+#define PWM_CTL_MSEN1      (1U << 7)
+#define PWM_CTL_PWEN2      (1U << 8)
+#define PWM_CTL_POLA2      (1U << 12)
+#define PWM_CTL_MSEN2      (1U << 15)
+
+/* Raspberry Pi 3 oscillator: 19.2 MHz / 24 / 800 = 1 kHz. */
+#define PWM_CLOCK_DIVIDER  24U
+#define PWM_RANGE          800U
+#define PWM_DUTY           400U
+
+#define ADS_CMD_RESET      0x06U
+#define ADS_CMD_START      0x08U
+#define ADS_CMD_STOP       0x0AU
+#define ADS_CMD_RDATA      0x12U
+#define ADS_CMD_RREG       0x20U
+#define ADS_CMD_WREG       0x40U
+
+#define ADS_REG_ID         0x00U
+#define ADS_REG_STATUS0    0x01U
+#define ADS_REG_STATUS2    0x12U
+#define ADS_REG_MODE0      0x02U
+#define ADS_REG_MODE1      0x03U
+#define ADS_REG_MODE3      0x05U
+#define ADS_REG_MODE4      0x10U
+
+#define ADS_MODE0_40000SPS          0x80U
+#define ADS_MODE1_CONTINUOUS_DELAY_50US  0x01U
+#define ADS_MODE3_STATUS_OFF       0x00U
+#define ADS_MODE4_MUX_AIN1_AINCOM  0x20U
+#define ADS_MODE4_MUX_AIN0_AINCOM  0x30U
+#define ADS_MODE4_GAIN_1            0x04U
+#define ADS_STATUS0_DRDY            (1U << 2)
+#define ADS_STATUS2_LOCK2           (1U << 5)
+#define ADS_STATUS2_CRC2            (1U << 4)
+
+#define ADS_CODE_FS        8388608LL
+#define ADS_VREF_UV        5000000LL
+#define ADS_GAIN_NUM       1LL
+#define ADS_GAIN_DEN       1LL
+
+/* 1 degree = 400 mV = 400 uV/mdeg */
+#define SENSOR_UV_PER_MDEG 400.0
+
+/* Final angle offset correction [mdeg].
+ * Change only these two values when zero-point correction is required.
+ * corrected angle = fitted angle + offset
+ */
+static double offset_ch1 = 0.0;
+static double offset_ch2 = 0.0;
+
+struct gpio_group {
+    int fd;
+    unsigned int count;
+};
+
+struct channel_state {
+    int32_t high_raw;
+    int32_t low_raw;
+
+    int64_t high_sum;
+    int64_t low_sum;
+    int64_t vcm_sum;
+    int64_t vdiff_sum;
+
+    uint32_t sample_count;
+};
+
+static volatile sig_atomic_t running = 1;
+
+static int spi_fd = -1;
+static struct gpio_group chip_select = {-1, 0};
+static struct gpio_group phase_drive = {-1, 0};
+static volatile uint32_t *gpio_regs;
+static volatile uint32_t *pwm_regs;
+static volatile uint32_t *clk_regs;
+static uint32_t saved_gpfsel1;
+static int pwm_gpio_configured;
+static int set_phase_high(void);
+static int set_phase_low(void);
+
+
+static pthread_t excitation_thread;
+static int excitation_thread_started = 0;
+static uint64_t excitation_epoch_us = 0;
+
+static _Atomic uint64_t excitation_edges = 0;
+static _Atomic uint64_t excitation_late_edges = 0;
+static _Atomic uint64_t excitation_max_late_us = 0;
+
+
+static void on_signal(int signo)
+{
+    (void)signo;
+    running = 0;
+}
+
+static uint64_t monotonic_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (uint64_t)ts.tv_sec * 1000000ULL +
+           (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static void sleep_until_us(uint64_t deadline_us)
+{
+    struct timespec ts = {
+        .tv_sec = (time_t)(deadline_us / 1000000ULL),
+        .tv_nsec = (long)((deadline_us % 1000000ULL) * 1000ULL)
+    };
+
+    int rc;
+
+    do {
+        rc = clock_nanosleep(
+            CLOCK_MONOTONIC,
+            TIMER_ABSTIME,
+            &ts,
+            NULL
+        );
+    } while (rc == EINTR && running);
+}
+
+static void peripheral_barrier(void)
+{
+    __sync_synchronize();
+}
+
+static int pwm1_level(void)
+{
+    return (gpio_regs[GPLEV0] & (1U << 18)) != 0U;
+}
+
+static int wait_pwm_edge(
+    int from_level,
+    int to_level,
+    uint64_t *edge_us)
+{
+    uint64_t deadline = monotonic_us() + PWM_EDGE_TIMEOUT_US;
+    int saw_from = 0;
+
+    while (running && monotonic_us() < deadline) {
+        int level = pwm1_level();
+
+        if (level == from_level) {
+            saw_from = 1;
+        } else if (saw_from && level == to_level) {
+            *edge_us = monotonic_us();
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+
+static void update_max_atomic(_Atomic uint64_t *target, uint64_t value)
+{
+    uint64_t old = atomic_load(target);
+
+    while (value > old &&
+           !atomic_compare_exchange_weak(target, &old, value)) {
+        /* retry with the newly observed value */
+    }
+}
+
+static void record_excitation_edge_timing(uint64_t deadline_us)
+{
+    uint64_t now = monotonic_us();
+    uint64_t late = now > deadline_us ? now - deadline_us : 0ULL;
+
+    atomic_fetch_add(&excitation_edges, 1ULL);
+
+    if (late > 20ULL)
+        atomic_fetch_add(&excitation_late_edges, 1ULL);
+
+    update_max_atomic(&excitation_max_late_us, late);
+}
+
+/*
+ * Dedicated 1-kHz complementary excitation task.
+ *
+ * ADC RESET / SPI / CSV work is deliberately NOT performed in this
+ * thread.  Therefore slow ADC recovery no longer stretches the sensor
+ * excitation period.
+ */
+static void *excitation_worker(void *unused)
+{
+    (void)unused;
+
+    /*
+     * Best effort real-time priority.  Running with sudo normally allows
+     * this.  Failure is not fatal; absolute CLOCK_MONOTONIC deadlines are
+     * still used.
+     */
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = 20;
+
+    if (pthread_setschedparam(
+            pthread_self(),
+            SCHED_FIFO,
+            &sp) != 0) {
+        fprintf(stderr,
+                "warning: excitation thread SCHED_FIFO unavailable; "
+                "continuing with normal scheduling\n");
+    }
+
+    uint64_t cycle_start = excitation_epoch_us;
+
+    while (running) {
+        sleep_until_us(cycle_start);
+
+        if (!running)
+            break;
+
+        if (set_phase_high() < 0) {
+            perror("excitation set_phase_high");
+            running = 0;
+            break;
+        }
+
+        record_excitation_edge_timing(cycle_start);
+
+        uint64_t low_deadline = cycle_start + HALF_PERIOD_US;
+        sleep_until_us(low_deadline);
+
+        if (!running)
+            break;
+
+        if (set_phase_low() < 0) {
+            perror("excitation set_phase_low");
+            running = 0;
+            break;
+        }
+
+        record_excitation_edge_timing(low_deadline);
+
+        cycle_start += PWM_PERIOD_US;
+
+        /*
+         * If Linux pauses this thread for multiple milliseconds, skip
+         * obsolete edges instead of outputting a high-speed catch-up burst.
+         */
+        uint64_t now = monotonic_us();
+        if (now > cycle_start + PWM_PERIOD_US) {
+            uint64_t periods_late =
+                (now - cycle_start) / PWM_PERIOD_US;
+            cycle_start += periods_late * PWM_PERIOD_US;
+        }
+    }
+
+    (void)set_phase_low();
+    return NULL;
+}
+
+/*
+ * Return the next occurrence of a particular point in the 1-ms excitation
+ * cycle.  phase_offset_us is 200 us for HIGH sampling and 700 us for LOW
+ * sampling.
+ */
+static uint64_t next_excitation_phase_us(uint64_t phase_offset_us)
+{
+    uint64_t now = monotonic_us() + SAMPLE_PHASE_GUARD_US;
+    uint64_t first = excitation_epoch_us + phase_offset_us;
+
+    if (now <= first)
+        return first;
+
+    uint64_t delta = now - first;
+    uint64_t periods =
+        (delta + PWM_PERIOD_US - 1ULL) / PWM_PERIOD_US;
+
+    return first + periods * PWM_PERIOD_US;
+}
+
+
+static void *map_peripheral(int mem_fd, off_t address)
+{
+    void *mapped = mmap(NULL, PERIPHERAL_SIZE,
+                        PROT_READ | PROT_WRITE, MAP_SHARED,
+                        mem_fd, address);
+
+    if (mapped == MAP_FAILED) {
+        perror("mmap");
+        return NULL;
+    }
+
+    return mapped;
+}
+
+static int wait_pwm_clock(int expected_busy)
+{
+    for (unsigned int i = 0; i < 1000000U; ++i) {
+        int busy = (clk_regs[CM_PWMCTL] & CM_CTL_BUSY) != 0;
+        if (busy == expected_busy)
+            return 0;
+    }
+    return -1;
+}
+
+static int start_hardware_pwm(uint64_t *epoch_us)
+{
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+
+    if (mem_fd < 0) {
+        perror("/dev/mem (run as root)");
+        return -1;
+    }
+
+    gpio_regs = map_peripheral(mem_fd, GPIO_BASE_PHYS);
+    pwm_regs = map_peripheral(mem_fd, PWM_BASE_PHYS);
+    clk_regs = map_peripheral(mem_fd, CLK_BASE_PHYS);
+    close(mem_fd);
+
+    if (gpio_regs == NULL || pwm_regs == NULL || clk_regs == NULL)
+        return -1;
+
+    saved_gpfsel1 = gpio_regs[GPFSEL1];
+    uint32_t fsel = saved_gpfsel1;
+    fsel &= ~((7U << 24) | (7U << 27));
+    fsel |= (2U << 24) | (2U << 27); /* GPIO18/19 ALT5 */
+    gpio_regs[GPFSEL1] = fsel;
+    peripheral_barrier();
+    pwm_gpio_configured = 1;
+
+    pwm_regs[PWM_CTL] = 0;
+    clk_regs[CM_PWMCTL] = CM_PASSWORD | CM_CTL_KILL;
+    peripheral_barrier();
+
+    if (wait_pwm_clock(0) < 0) {
+        fprintf(stderr, "PWM clock did not stop\n");
+        return -1;
+    }
+
+    clk_regs[CM_PWMDIV] = CM_PASSWORD | (PWM_CLOCK_DIVIDER << 12);
+    clk_regs[CM_PWMCTL] =
+        CM_PASSWORD | CM_CTL_SRC_OSC | CM_CTL_ENAB;
+    peripheral_barrier();
+
+    if (wait_pwm_clock(1) < 0) {
+        fprintf(stderr, "PWM clock did not start\n");
+        return -1;
+    }
+
+    pwm_regs[PWM_STA] = 0x01FCU;
+    pwm_regs[PWM_RNG1] = PWM_RANGE;
+    usleep(10);
+    pwm_regs[PWM_DAT1] = PWM_DUTY;
+    pwm_regs[PWM_RNG2] = PWM_RANGE;
+    usleep(10);
+    pwm_regs[PWM_DAT2] = PWM_DUTY;
+    peripheral_barrier();
+
+    /* One write starts both channels; channel 2 is polarity-inverted. */
+    pwm_regs[PWM_CTL] =
+        PWM_CTL_PWEN1 | PWM_CTL_MSEN1 |
+        PWM_CTL_PWEN2 | PWM_CTL_POLA2 | PWM_CTL_MSEN2;
+    peripheral_barrier();
+
+    *epoch_us = monotonic_us();
+    return 0;
+}
+
+static void stop_hardware_pwm(void)
+{
+    if (pwm_regs != NULL) {
+        pwm_regs[PWM_CTL] = 0;
+        peripheral_barrier();
+    }
+    if (gpio_regs != NULL && pwm_gpio_configured) {
+        gpio_regs[GPFSEL1] = saved_gpfsel1;
+        peripheral_barrier();
+    }
+    if (gpio_regs != NULL)
+        munmap((void *)gpio_regs, PERIPHERAL_SIZE);
+    if (pwm_regs != NULL)
+        munmap((void *)pwm_regs, PERIPHERAL_SIZE);
+    if (clk_regs != NULL)
+        munmap((void *)clk_regs, PERIPHERAL_SIZE);
+
+    gpio_regs = NULL;
+    pwm_regs = NULL;
+    clk_regs = NULL;
+    pwm_gpio_configured = 0;
+}
+
+static int gpio_request(
+    int chip_fd,
+    const unsigned int *offsets,
+    unsigned int count,
+    uint64_t flags,
+    uint64_t initial_bits,
+    const char *consumer,
+    struct gpio_group *group)
+{
+    struct gpio_v2_line_request req;
+
+    memset(&req, 0, sizeof(req));
+
+    for (unsigned int i = 0; i < count; ++i)
+        req.offsets[i] = offsets[i];
+
+    req.num_lines = count;
+    req.config.flags = flags;
+
+    snprintf(
+        req.consumer,
+        sizeof(req.consumer),
+        "%s",
+        consumer
+    );
+
+    if (flags & GPIO_V2_LINE_FLAG_OUTPUT) {
+        req.config.num_attrs = 1;
+
+        req.config.attrs[0].attr.id =
+            GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
+
+        req.config.attrs[0].attr.values = initial_bits;
+        req.config.attrs[0].mask = (1ULL << count) - 1ULL;
+    }
+
+    if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
+        perror("GPIO_V2_GET_LINE_IOCTL");
+        return -1;
+    }
+
+    group->fd = req.fd;
+    group->count = count;
+
+    return 0;
+}
+
+static int gpio_set(
+    const struct gpio_group *group,
+    uint64_t bits)
+{
+    struct gpio_v2_line_values values = {
+        .bits = bits,
+        .mask = (1ULL << group->count) - 1ULL
+    };
+
+    return ioctl(
+        group->fd,
+        GPIO_V2_LINE_SET_VALUES_IOCTL,
+        &values
+    );
+}
+
+/*
+ * Software complementary drive on GPIO18/GPIO19.
+ * phase_drive offsets are {18, 19}, so:
+ *   0x1 => GPIO18=1, GPIO19=0
+ *   0x2 => GPIO18=0, GPIO19=1
+ */
+static int set_phase_high(void)
+{
+    return gpio_set(&phase_drive, 0x1ULL);
+}
+
+static int set_phase_low(void)
+{
+    return gpio_set(&phase_drive, 0x2ULL);
+}
+
+static int gpio_get(const struct gpio_group *group)
+{
+    struct gpio_v2_line_values values = {
+        .bits = 0,
+        .mask = 1
+    };
+
+    if (ioctl(
+            group->fd,
+            GPIO_V2_LINE_GET_VALUES_IOCTL,
+            &values) < 0) {
+        return -1;
+    }
+
+    return (int)(values.bits & 1ULL);
+}
+
+static int select_cs(unsigned int cs)
+{
+    return gpio_set(
+        &chip_select,
+        cs == 1U ? 0x2ULL : 0x1ULL
+    );
+}
+
+static void deselect_cs(void)
+{
+    (void)gpio_set(&chip_select, 0x3ULL);
+}
+
+static uint8_t ads_crc8(
+    const uint8_t *data,
+    size_t len)
+{
+    uint8_t crc = 0xFFU;
+
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+
+        for (unsigned int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80U)
+                ? (uint8_t)((crc << 1) ^ 0x07U)
+                : (uint8_t)(crc << 1);
+        }
+    }
+
+    return crc;
+}
+
+static int spi_transfer(
+    const uint8_t *tx,
+    uint8_t *rx,
+    size_t len)
+{
+    struct spi_ioc_transfer tr;
+
+    memset(&tr, 0, sizeof(tr));
+
+    tr.tx_buf = (uintptr_t)tx;
+    tr.rx_buf = (uintptr_t)rx;
+    tr.len = (uint32_t)len;
+    tr.speed_hz = SPI_SPEED_HZ;
+    tr.bits_per_word = 8;
+
+    return ioctl(
+        spi_fd,
+        SPI_IOC_MESSAGE(1),
+        &tr
+    ) < 0 ? -1 : 0;
+}
+
+static int ads_transaction(
+    unsigned int cs,
+    const uint8_t *tx,
+    uint8_t *rx,
+    size_t len)
+{
+    /*
+     * Guard time between CS1/CS2 transactions.
+     * The minimal diagnostic showed CS2 works in isolation,
+     * while the main loop returned FF FF FF FF during fast
+     * CS1 -> CS2 switching. Force both CS lines high first,
+     * then add small setup/hold gaps around the SPI transfer.
+     */
+    deselect_cs();
+    usleep(2);
+
+    if (select_cs(cs) < 0)
+        return -1;
+
+    usleep(1);
+
+    int rc = spi_transfer(tx, rx, len);
+
+    usleep(1);
+    deselect_cs();
+    usleep(2);
+
+    return rc;
+}
+
+static int ads_command(uint8_t command)
+{
+    uint8_t tx[4] = {command, 0, 0, 0};
+    uint8_t rx[4] = {0};
+
+    tx[2] = ads_crc8(tx, 2);
+
+    if (ads_transaction(1, tx, rx, sizeof(tx)) < 0)
+        return -1;
+
+    return rx[3] == tx[2] ? 0 : -1;
+}
+
+static int ads_read_reg(
+    uint8_t address,
+    uint8_t *value)
+{
+    uint8_t tx[6] = {0};
+    uint8_t rx[6] = {0};
+
+    tx[0] = ADS_CMD_RREG | (address & 0x1FU);
+    tx[2] = ads_crc8(tx, 2);
+
+    unsigned int cs = address >= 0x10U ? 2U : 1U;
+
+    if (ads_transaction(cs, tx, rx, sizeof(tx)) < 0)
+        return -1;
+
+    if (rx[3] != tx[2])
+        return -1;
+
+    if (rx[5] != ads_crc8(&rx[4], 1))
+        return -1;
+
+    *value = rx[4];
+
+    return 0;
+}
+
+static int ads_write_reg(
+    uint8_t address,
+    uint8_t value)
+{
+    uint8_t tx[4] = {
+        ADS_CMD_WREG | (address & 0x1FU),
+        value,
+        0,
+        0
+    };
+
+    uint8_t rx[4] = {0};
+
+    tx[2] = ads_crc8(tx, 2);
+
+    unsigned int cs = address >= 0x10U ? 2U : 1U;
+
+    if (ads_transaction(cs, tx, rx, sizeof(tx)) < 0) {
+        fprintf(stderr,
+                "WREG SPI FAIL: addr=0x%02X value=0x%02X CS%u errno=%d\n",
+                address, value, cs, errno);
+        return -1;
+    }
+
+    if (rx[3] != tx[2]) {
+        fprintf(stderr,
+                "WREG ACK/CRC FAIL: addr=0x%02X value=0x%02X CS%u "
+                "TX=%02X %02X %02X %02X "
+                "RX=%02X %02X %02X %02X\n",
+                address, value, cs,
+                tx[0], tx[1], tx[2], tx[3],
+                rx[0], rx[1], rx[2], rx[3]);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int ads_read_data(int32_t *code)
+{
+    uint8_t tx[8] = {
+        ADS_CMD_RDATA, 0, 0, 0,
+        0, 0, 0, 0
+    };
+
+    uint8_t rx[8] = {0};
+
+    tx[2] = ads_crc8(tx, 2);
+
+    if (ads_transaction(1, tx, rx, sizeof(tx)) < 0)
+        return -1;
+
+    if (rx[3] != tx[2])
+        return -1;
+
+    if (rx[7] != ads_crc8(&rx[4], 3))
+        return -1;
+
+    uint32_t raw =
+        ((uint32_t)rx[4] << 16) |
+        ((uint32_t)rx[5] << 8) |
+        (uint32_t)rx[6];
+
+    if (raw & 0x800000UL)
+        raw |= 0xFF000000UL;
+
+    *code = (int32_t)raw;
+
+    return 0;
+}
+
+static int ads_init(void)
+{
+    uint8_t id = 0;
+    uint8_t mode0 = 0;
+    uint8_t mode1 = 0;
+
+    deselect_cs();
+    usleep(1000);
+
+    if (ads_command(ADS_CMD_RESET) < 0) {
+        fprintf(stderr, "ADS reset failed\n");
+        return -1;
+    }
+
+    usleep(10000);
+
+    if (ads_read_reg(ADS_REG_ID, &id) < 0 ||
+        (id & 0xF0U) != 0x60U) {
+        fprintf(
+            stderr,
+            "ADS ID read failed (ID=0x%02X)\n",
+            id
+        );
+        return -1;
+    }
+
+    printf("ADS ID=0x%02X\n", id);
+
+    if (ads_write_reg(
+            ADS_REG_MODE3,
+            ADS_MODE3_STATUS_OFF) < 0) {
+        fprintf(stderr, "ADS MODE3 configuration failed\n");
+        return -1;
+    }
+
+    if (ads_write_reg(
+            ADS_REG_MODE0,
+            ADS_MODE0_40000SPS) < 0) {
+        fprintf(stderr, "ADS MODE0 configuration failed\n");
+        return -1;
+    }
+
+    if (ads_write_reg(
+            ADS_REG_MODE1,
+            ADS_MODE1_CONTINUOUS_DELAY_50US) < 0) {
+        fprintf(stderr, "ADS MODE1 configuration failed\n");
+        return -1;
+    }
+
+    if (ads_read_reg(ADS_REG_MODE0, &mode0) < 0 ||
+        mode0 != ADS_MODE0_40000SPS) {
+        fprintf(stderr,
+                "ADS MODE0 verification failed "
+                "(expected=0x%02X, actual=0x%02X)\n",
+                ADS_MODE0_40000SPS,
+                mode0);
+        return -1;
+    }
+
+    if (ads_read_reg(ADS_REG_MODE1, &mode1) < 0 ||
+        mode1 != ADS_MODE1_CONTINUOUS_DELAY_50US) {
+        fprintf(stderr,
+                "ADS MODE1 verification failed "
+                "(expected=0x%02X, actual=0x%02X)\n",
+                ADS_MODE1_CONTINUOUS_DELAY_50US,
+                mode1);
+        return -1;
+    }
+
+    printf("ADS MODE0=0x%02X, MODE1=0x%02X\n",
+           mode0,
+           mode1);
+
+    if (ads_write_reg(
+            ADS_REG_MODE4,
+            ADS_MODE4_MUX_AIN0_AINCOM |
+            ADS_MODE4_GAIN_1) < 0) {
+        fprintf(stderr, "ADS MODE4 configuration failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
+ * Workaround for the observed Pi3/ADS125H02 behavior:
+ *
+ *   - CS2 works normally after RESET.
+ *   - One RDATA transaction through CS1 makes CS2 stop responding.
+ *   - CS1 remains alive.
+ *   - RESET restores CS2.
+ *
+ * Therefore every conversion is treated as a self-contained transaction:
+ *
+ *   RESET -> configure CS1 regs -> configure MODE4 via CS2
+ *         -> START -> wait STATUS0.DRDY -> RDATA
+ *
+ * The next sample starts with another RESET, so no CS2 access is attempted
+ * after RDATA.
+ */
+static int ads_reset_configure_channel(unsigned int channel)
+{
+    uint8_t mux = channel == 0U
+        ? ADS_MODE4_MUX_AIN0_AINCOM
+        : ADS_MODE4_MUX_AIN1_AINCOM;
+
+    if (ads_command(ADS_CMD_RESET) < 0) {
+        fprintf(stderr, "ADS RESET failed\n");
+        return -1;
+    }
+
+    /*
+     * RESET command restarts the device logic.  Give it conservative
+     * settling time before the following register writes.
+     */
+    usleep(ADS_RESET_SETTLE_US);
+
+    if (ads_write_reg(
+            ADS_REG_MODE3,
+            ADS_MODE3_STATUS_OFF) < 0) {
+        fprintf(stderr, "ADS MODE3 write failed after RESET\n");
+        return -1;
+    }
+
+    if (ads_write_reg(
+            ADS_REG_MODE0,
+            ADS_MODE0_40000SPS) < 0) {
+        fprintf(stderr, "ADS MODE0 write failed after RESET\n");
+        return -1;
+    }
+
+    if (ads_write_reg(
+            ADS_REG_MODE1,
+            ADS_MODE1_CONTINUOUS_DELAY_50US) < 0) {
+        fprintf(stderr, "ADS MODE1 write failed after RESET\n");
+        return -1;
+    }
+
+    if (ads_write_reg(
+            ADS_REG_MODE4,
+            mux | ADS_MODE4_GAIN_1) < 0) {
+        fprintf(stderr,
+                "CH%u MODE4 write failed after RESET\n",
+                channel + 1U);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int wait_drdy_status(uint32_t timeout_us)
+{
+    uint64_t deadline = monotonic_us() + timeout_us;
+
+    while (running && monotonic_us() < deadline) {
+        uint8_t status0 = 0;
+
+        if (ads_read_reg(ADS_REG_STATUS0, &status0) < 0)
+            return -1;
+
+        /*
+         * STATUS0.DRDY = 1 means conversion data are ready.
+         * This avoids relying on the external DRDY GPIO edge.
+         */
+        if ((status0 & ADS_STATUS0_DRDY) != 0U)
+            return 0;
+    }
+
+    return -1;
+}
+
+static void dump_status2(const char *reason)
+{
+    uint8_t status2 = 0;
+
+    if (ads_read_reg(ADS_REG_STATUS2, &status2) < 0) {
+        fprintf(stderr,
+                "STATUS2 read failed after %s\\n",
+                reason);
+        return;
+    }
+
+    fprintf(stderr,
+            "STATUS2 after %s: 0x%02X (LOCK2=%u CRC2=%u)\\n",
+            reason,
+            status2,
+            (status2 & ADS_STATUS2_LOCK2) ? 1U : 0U,
+            (status2 & ADS_STATUS2_CRC2) ? 1U : 0U);
+}
+
+static int ads_select_channel(unsigned int channel)
+{
+    uint8_t mux = channel == 0U
+        ? ADS_MODE4_MUX_AIN0_AINCOM
+        : ADS_MODE4_MUX_AIN1_AINCOM;
+
+    return ads_write_reg(
+        ADS_REG_MODE4,
+        mux | ADS_MODE4_GAIN_1
+    );
+}
+
+static int retry_ads_select_channel(unsigned int channel)
+{
+    unsigned int retry_count = 0;
+
+    while (running) {
+        if (ads_select_channel(channel) == 0) {
+            if (retry_count > 0) {
+                fprintf(stderr,
+                        "CH%u MUX recovered after %u retries\n",
+                        channel + 1U,
+                        retry_count);
+            }
+
+            return 0;
+        }
+
+        retry_count++;
+
+        if (retry_count == 1U ||
+            retry_count % 1000U == 0U) {
+            fprintf(stderr,
+                    "CH%u MUX selection failed; retrying (%u)\n",
+                    channel + 1U,
+                    retry_count);
+
+            dump_status2(
+                channel == 0U
+                    ? "CH1 MODE4 write failure"
+                    : "CH2 MODE4 write failure");
+        }
+
+        deselect_cs();
+        usleep(1000);
+    }
+
+    return -1;
+}
+
+static int ads_reset_restart_and_read_at_phase(
+    unsigned int channel,
+    uint64_t phase_offset_us,
+    int32_t *raw)
+{
+    /*
+     * Perform the slow RESET/reconfigure portion first while the excitation
+     * thread continues independently at 1 kHz.
+     */
+    if (ads_reset_configure_channel(channel) < 0)
+        return -1;
+
+    /*
+     * Then synchronize START to the next requested excitation phase.
+     * We never attempt to "catch up" an old 1-kHz cycle.
+     */
+    uint64_t target = next_excitation_phase_us(phase_offset_us);
+    sleep_until_us(target);
+
+    if (ads_command(ADS_CMD_START) < 0) {
+        fprintf(stderr, "ADS START command failed\n");
+        return -1;
+    }
+
+    if (wait_drdy_status(DRDY_TIMEOUT_US) < 0) {
+        static unsigned long timeout_count = 0;
+        timeout_count++;
+
+        if (timeout_count == 1UL ||
+            (timeout_count % 100UL) == 0UL) {
+            fprintf(stderr,
+                    "STATUS0 DRDY timeout (%lu)\n",
+                    timeout_count);
+        }
+
+        return -1;
+    }
+
+    if (ads_read_data(raw) < 0) {
+        fprintf(stderr, "ADS RDATA failed\n");
+        return -1;
+    }
+
+    /*
+     * Do not touch CS2 after RDATA.  The next sample begins with RESET.
+     */
+    return 0;
+}
+
+static void accumulate_channel(
+    struct channel_state *channel)
+{
+    int64_t high = channel->high_raw;
+    int64_t low = channel->low_raw;
+
+    channel->high_sum += high;
+    channel->low_sum += low;
+    channel->vcm_sum += (high + low) / 2;
+    channel->vdiff_sum += (high - low) / 2;
+    channel->sample_count++;
+}
+
+static void reset_channel_average(
+    struct channel_state *channel)
+{
+    channel->high_sum = 0;
+    channel->low_sum = 0;
+    channel->vcm_sum = 0;
+    channel->vdiff_sum = 0;
+    channel->sample_count = 0;
+}
+
+static int32_t code_to_uv(int64_t code)
+{
+    int64_t uv =
+        code *
+        ADS_VREF_UV *
+        ADS_GAIN_DEN;
+
+    uv /= ADS_CODE_FS * ADS_GAIN_NUM;
+
+    return (int32_t)uv;
+}
+
+static int read_board_temp_mC(void)
+{
+    int fd = open(
+        "/sys/class/thermal/thermal_zone0/temp",
+        O_RDONLY | O_CLOEXEC
+    );
+
+    if (fd < 0)
+        return -1;
+
+    char buffer[32];
+    ssize_t length = read(fd, buffer, sizeof(buffer) - 1U);
+
+    close(fd);
+
+    if (length <= 0)
+        return -1;
+
+    buffer[length] = '\0';
+
+    char *end = NULL;
+    long value = strtol(buffer, &end, 10);
+
+    if (end == buffer)
+        return -1;
+
+    return (int)value;
+}
+
+/* Fifth-order calibration: measured angle T [mdeg] -> corrected C [mdeg]. */
+static double fit_angle_mdeg(double t)
+{
+    return ((((-4.20529061e-17 * t
+               - 7.57486695e-13) * t
+              + 9.26577767e-9) * t
+             - 1.15097020e-5) * t
+            + 0.916180507) * t
+           - 0.568154573;
+}
+
+static int open_udp(
+    const char *address,
+    uint16_t port,
+    struct sockaddr_in *destination)
+{
+    int fd = socket(
+        AF_INET,
+        SOCK_DGRAM | SOCK_NONBLOCK,
+        0
+    );
+
+    if (fd < 0)
+        return -1;
+
+    memset(destination, 0, sizeof(*destination));
+
+    destination->sin_family = AF_INET;
+    destination->sin_port = htons(port);
+
+    if (inet_pton(
+            AF_INET,
+            address,
+            &destination->sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static void cleanup(void)
+{
+    if (phase_drive.fd >= 0) {
+        (void)gpio_set(&phase_drive, 0x0ULL);
+        close(phase_drive.fd);
+        phase_drive.fd = -1;
+    }
+
+    if (chip_select.fd >= 0) {
+        deselect_cs();
+        close(chip_select.fd);
+    }
+
+    if (spi_fd >= 0)
+        close(spi_fd);
+}
+
+int main(int argc, char **argv)
+{
+    const char *udp_address =
+        argc > 1 ? argv[1] : "192.168.1.100";
+
+    uint16_t udp_port =
+        argc > 2
+        ? (uint16_t)strtoul(argv[2], NULL, 10)
+        : 5005;
+
+    int chip_fd = -1;
+    int udp_fd = -1;
+
+    struct sockaddr_in udp_destination;
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    atexit(cleanup);
+
+    chip_fd = open(GPIO_CHIP, O_RDONLY | O_CLOEXEC);
+
+    if (chip_fd < 0) {
+        perror(GPIO_CHIP);
+        return EXIT_FAILURE;
+    }
+
+    const unsigned int cs_offsets[] = {
+        GPIO_ADC_CS1,
+        GPIO_ADC_CS2
+    };
+
+    const unsigned int phase_offsets[] = {
+        18U,
+        19U
+    };
+
+    if (gpio_request(
+            chip_fd,
+            cs_offsets,
+            2,
+            GPIO_V2_LINE_FLAG_OUTPUT,
+            0x3,
+            "ads-cs",
+            &chip_select) < 0 ||
+
+        gpio_request(
+            chip_fd,
+            phase_offsets,
+            2,
+            GPIO_V2_LINE_FLAG_OUTPUT,
+            0x2,
+            "phase-drive",
+            &phase_drive) < 0) {
+
+        close(chip_fd);
+        return EXIT_FAILURE;
+    }
+
+    close(chip_fd);
+
+    spi_fd = open(SPI_DEVICE, O_RDWR | O_CLOEXEC);
+
+    if (spi_fd < 0) {
+        perror(SPI_DEVICE);
+        return EXIT_FAILURE;
+    }
+
+    uint32_t mode = SPI_MODE_1 | SPI_NO_CS;
+    uint8_t bits = 8;
+    uint32_t speed = SPI_SPEED_HZ;
+
+    if (ioctl(spi_fd, SPI_IOC_WR_MODE32, &mode) < 0 ||
+        ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
+        ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+        perror("SPI configuration");
+        return EXIT_FAILURE;
+    }
+
+    if (ads_init() < 0)
+        return EXIT_FAILURE;
+
+    udp_fd = open_udp(
+        udp_address,
+        udp_port,
+        &udp_destination
+    );
+
+    if (udp_fd < 0) {
+        fprintf(
+            stderr,
+            "UDP disabled: invalid destination or socket error\n"
+        );
+    }
+
+    /*
+     * Start excitation a few milliseconds in the future so the worker has
+     * time to enter its absolute-time loop before the first edge.
+     */
+    excitation_epoch_us = monotonic_us() + 5000ULL;
+
+    if (pthread_create(
+            &excitation_thread,
+            NULL,
+            excitation_worker,
+            NULL) != 0) {
+        perror("pthread_create excitation");
+        return EXIT_FAILURE;
+    }
+
+    excitation_thread_started = 1;
+
+    struct channel_state channels[2] = {0};
+
+    unsigned int selected_channel = 0U;
+    unsigned int warmup_pairs = 10U;
+
+    double ch1_vdiff_lpf_uv = 0.0;
+    double ch2_vdiff_lpf_uv = 0.0;
+    double board_temp_lpf_mC = -1.0;
+    int lpf_initialized = 0;
+    int temp_lpf_initialized = 0;
+
+    uint64_t program_epoch = monotonic_us();
+    uint64_t last_report = program_epoch;
+
+    uint64_t adc_failures = 0;
+    uint64_t completed_pairs = 0;
+
+    fprintf(stderr,
+            "ADS ID=0x61 | 1kHz excitation | RESET-per-RDATA workaround\n");
+
+    puts(
+        "time,Temp_raw_mC,Temp_LPF_mC,"
+        "CH1_HIGH_raw,CH1_LOW_raw,CH1_VDIFF_raw_uV,"
+        "CH1_VDIFF_mdeg,CH1_LPF_fitted_mdeg,CH1_LPF_fitted_mdeg_offset,"
+        "CH2_HIGH_raw,CH2_LOW_raw,CH2_VDIFF_raw_uV,"
+        "CH2_VDIFF_mdeg,CH2_LPF_fitted_mdeg,CH2_LPF_fitted_mdeg_offset"
+    );
+
+    /*
+     * ADC sampling is intentionally slower than the 1-kHz excitation.
+     * Each HIGH/LOW sample may come from a later excitation cycle, but both
+     * are phase-locked to the same continuously running 1-kHz waveform.
+     */
+    while (running) {
+        struct channel_state *channel =
+            &channels[selected_channel];
+
+        int valid_high =
+            ads_reset_restart_and_read_at_phase(
+                selected_channel,
+                EXTERNAL_SETTLING_US,
+                &channel->high_raw) == 0;
+
+        if (!valid_high)
+            adc_failures++;
+
+        int valid_low = 0;
+
+        if (running) {
+            valid_low =
+                ads_reset_restart_and_read_at_phase(
+                    selected_channel,
+                    HALF_PERIOD_US + EXTERNAL_SETTLING_US,
+                    &channel->low_raw) == 0;
+
+            if (!valid_low)
+                adc_failures++;
+        }
+
+        if (valid_high && valid_low) {
+            if (warmup_pairs > 0U) {
+                warmup_pairs--;
+            } else {
+                accumulate_channel(channel);
+                completed_pairs++;
+            }
+        }
+
+        selected_channel ^= 1U;
+
+        uint64_t now = monotonic_us();
+
+        if (now - last_report < REPORT_INTERVAL_US)
+            continue;
+
+        if (channels[0].sample_count == 0 ||
+            channels[1].sample_count == 0) {
+            last_report = now;
+            continue;
+        }
+
+        uint32_t ch1_count = channels[0].sample_count;
+        uint32_t ch2_count = channels[1].sample_count;
+
+        int64_t ch1_high_avg =
+            channels[0].high_sum / ch1_count;
+        int64_t ch1_low_avg =
+            channels[0].low_sum / ch1_count;
+        int64_t ch1_vdiff_avg =
+            channels[0].vdiff_sum / ch1_count;
+
+        int64_t ch2_high_avg =
+            channels[1].high_sum / ch2_count;
+        int64_t ch2_low_avg =
+            channels[1].low_sum / ch2_count;
+        int64_t ch2_vdiff_avg =
+            channels[1].vdiff_sum / ch2_count;
+
+        int32_t ch1_vdiff_uv =
+            code_to_uv(ch1_vdiff_avg);
+        int32_t ch2_vdiff_uv =
+            code_to_uv(ch2_vdiff_avg);
+
+        double ch1_angle_mdeg =
+            ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
+        double ch2_angle_mdeg =
+            ch2_vdiff_uv / SENSOR_UV_PER_MDEG;
+
+        double dt =
+            (double)(now - last_report) / 1000000.0;
+
+        if (!lpf_initialized) {
+            ch1_vdiff_lpf_uv = (double)ch1_vdiff_uv;
+            ch2_vdiff_lpf_uv = (double)ch2_vdiff_uv;
+            lpf_initialized = 1;
+        } else {
+            double alpha = dt / (LPF_TAU_SECONDS + dt);
+
+            ch1_vdiff_lpf_uv +=
+                alpha * ((double)ch1_vdiff_uv - ch1_vdiff_lpf_uv);
+
+            ch2_vdiff_lpf_uv +=
+                alpha * ((double)ch2_vdiff_uv - ch2_vdiff_lpf_uv);
+        }
+
+        double ch1_lpf_input_mdeg =
+            ch1_vdiff_lpf_uv / SENSOR_UV_PER_MDEG;
+        double ch2_lpf_input_mdeg =
+            ch2_vdiff_lpf_uv / SENSOR_UV_PER_MDEG;
+
+        double ch1_lpf_mdeg =
+            fit_angle_mdeg(ch1_lpf_input_mdeg);
+        double ch2_lpf_mdeg =
+            fit_angle_mdeg(ch2_lpf_input_mdeg);
+
+        double ch1_lpf_mdeg_offset =
+            ch1_lpf_mdeg + offset_ch1;
+        double ch2_lpf_mdeg_offset =
+            ch2_lpf_mdeg + offset_ch2;
+
+        double elapsed_time_s =
+            (double)(now - program_epoch) / 1000000.0;
+
+        int board_temp_mC = read_board_temp_mC();
+
+        if (board_temp_mC >= 0) {
+            if (!temp_lpf_initialized) {
+                board_temp_lpf_mC = (double)board_temp_mC;
+                temp_lpf_initialized = 1;
+            } else {
+                double alpha = dt / (LPF_TAU_SECONDS + dt);
+
+                board_temp_lpf_mC +=
+                    alpha *
+                    ((double)board_temp_mC - board_temp_lpf_mC);
+            }
+        }
+
+        char console_message[448];
+
+        int console_length = snprintf(
+            console_message,
+            sizeof(console_message),
+            "%.3f,%d,%.1f,"
+            "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
+            "%lld,%lld,%ld,%.3f,%.3f,%.3f\n",
+
+            elapsed_time_s,
+            board_temp_mC,
+            temp_lpf_initialized ? board_temp_lpf_mC : -1.0,
+
+            (long long)ch1_high_avg,
+            (long long)ch1_low_avg,
+            (long)ch1_vdiff_uv,
+            ch1_angle_mdeg,
+            ch1_lpf_mdeg,
+            ch1_lpf_mdeg_offset,
+
+            (long long)ch2_high_avg,
+            (long long)ch2_low_avg,
+            (long)ch2_vdiff_uv,
+            ch2_angle_mdeg,
+            ch2_lpf_mdeg,
+            ch2_lpf_mdeg_offset
+        );
+
+        if (console_length > 0) {
+            fputs(console_message, stdout);
+            fflush(stdout);
+        }
+
+        char compact_message[128];
+
+        int compact_length = snprintf(
+            compact_message,
+            sizeof(compact_message),
+            "%.1f,%.3f,%.1f,%.3f\n",
+            ch1_vdiff_lpf_uv,
+            ch1_lpf_mdeg_offset,
+            ch2_vdiff_lpf_uv,
+            ch2_lpf_mdeg_offset
+        );
+
+        if (udp_fd >= 0 && compact_length > 0) {
+            (void)sendto(
+                udp_fd,
+                compact_message,
+                (size_t)compact_length,
+                0,
+                (struct sockaddr *)&udp_destination,
+                sizeof(udp_destination)
+            );
+        }
+
+        /*
+         * Keep the legacy-style console output clean: one CSV row per
+         * report interval.  Internal diagnostic counters are simply reset.
+         */
+        (void)atomic_exchange(&excitation_edges, 0ULL);
+        (void)atomic_exchange(&excitation_late_edges, 0ULL);
+        (void)atomic_exchange(&excitation_max_late_us, 0ULL);
+
+        adc_failures = 0;
+        completed_pairs = 0;
+
+        reset_channel_average(&channels[0]);
+        reset_channel_average(&channels[1]);
+
+        last_report = now;
+    }
+
+    running = 0;
+
+    if (excitation_thread_started) {
+        (void)pthread_join(excitation_thread, NULL);
+        excitation_thread_started = 0;
+    }
+
+    if (phase_drive.fd >= 0)
+        (void)gpio_set(&phase_drive, 0x0ULL);
+
+    if (udp_fd >= 0)
+        close(udp_fd);
+
+    return EXIT_SUCCESS;
+}
