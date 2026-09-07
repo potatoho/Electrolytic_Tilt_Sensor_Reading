@@ -30,10 +30,10 @@
 
 #define PWM_PERIOD_US       1000ULL
 #define HALF_PERIOD_US       500ULL
-#define EXTERNAL_SETTLING_US 200U
+#define EXTERNAL_SETTLING_US 250U
 #define DRDY_TIMEOUT_US      250U
 #define ADS_RESET_SETTLE_US  200U
-#define SAMPLE_PHASE_GUARD_US 40ULL
+#define SAMPLE_PHASE_GUARD_US 150ULL
 #define PWM_EDGE_TIMEOUT_US 3000U
 #define REPORT_INTERVAL_US   1000000ULL
 #define LPF_TAU_SECONDS       5.0
@@ -327,13 +327,21 @@ static void *excitation_worker(void *unused)
  */
 static uint64_t next_excitation_phase_us(uint64_t phase_offset_us)
 {
-    uint64_t now = monotonic_us() + SAMPLE_PHASE_GUARD_US;
+    /*
+     * Leave a generous lead-time before the requested phase.
+     * If we are too close to the current cycle's target, skip that cycle
+     * and use the same phase in the next 1-ms excitation period.
+     *
+     * This intentionally trades sample count for timing margin.
+     */
+    uint64_t now = monotonic_us();
+    uint64_t earliest_safe_target = now + SAMPLE_PHASE_GUARD_US;
     uint64_t first = excitation_epoch_us + phase_offset_us;
 
-    if (now <= first)
+    if (earliest_safe_target <= first)
         return first;
 
-    uint64_t delta = now - first;
+    uint64_t delta = earliest_safe_target - first;
     uint64_t periods =
         (delta + PWM_PERIOD_US - 1ULL) / PWM_PERIOD_US;
 
@@ -1000,6 +1008,21 @@ static int ads_reset_restart_and_read_at_phase(
      */
     uint64_t target = next_excitation_phase_us(phase_offset_us);
     sleep_until_us(target);
+
+    /*
+     * If Linux wakes us very late, do not start a conversion close to the
+     * next excitation edge.  Skip this sample instead; the caller will try
+     * again on a later phase/cycle.
+     */
+    uint64_t actual_start_request_us = monotonic_us();
+    uint64_t phase_late_us =
+        actual_start_request_us > target
+        ? actual_start_request_us - target
+        : 0ULL;
+
+    if (phase_late_us > 100ULL) {
+        return -1;
+    }
 
     if (ads_command(ADS_CMD_START) < 0) {
         fprintf(stderr, "ADS START command failed\n");
