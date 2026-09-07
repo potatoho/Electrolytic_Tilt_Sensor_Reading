@@ -34,6 +34,12 @@
 #define DRDY_TIMEOUT_US      250U
 #define ADS_RESET_SETTLE_US  200U
 #define SAMPLE_PHASE_GUARD_US 150ULL
+#define PHASE_LATE_REJECT_US   100ULL
+#define REPORT_MAX_SAMPLES      512U
+#define TRIM_SAMPLES_EACH_SIDE    2U
+#define OUTLIER_MIN_THRESHOLD_COUNTS 2000LL
+#define OUTLIER_MAD_MULTIPLIER 6LL
+#define OUTLIER_MIN_ACCEPTED_PAIRS 8U
 #define PWM_EDGE_TIMEOUT_US 3000U
 #define REPORT_INTERVAL_US   1000000ULL
 #define LPF_TAU_SECONDS       5.0
@@ -127,6 +133,18 @@ struct channel_state {
     int64_t vdiff_sum;
 
     uint32_t sample_count;
+
+    int32_t high_min;
+    int32_t high_max;
+    int32_t low_min;
+    int32_t low_max;
+    int extrema_valid;
+
+    /* Keep one report interval of raw pairs for robust diagnostics. */
+    int32_t high_samples[REPORT_MAX_SAMPLES];
+    int32_t low_samples[REPORT_MAX_SAMPLES];
+    uint32_t stored_samples;
+    uint32_t dropped_samples;
 };
 
 static volatile sig_atomic_t running = 1;
@@ -150,6 +168,16 @@ static uint64_t excitation_epoch_us = 0;
 static _Atomic uint64_t excitation_edges = 0;
 static _Atomic uint64_t excitation_late_edges = 0;
 static _Atomic uint64_t excitation_max_late_us = 0;
+static _Atomic uint64_t excitation_gpio_max_us = 0;
+static _Atomic uint64_t excitation_gpio_failures = 0;
+
+/* Per-report ADC/sample diagnostics. Slots: CH1_HIGH, CH1_LOW, CH2_HIGH, CH2_LOW. */
+static _Atomic uint64_t sample_phase_max_late_us[4] = {0};
+static _Atomic uint64_t sample_phase_rejects[4] = {0};
+static _Atomic uint64_t ads_reset_config_failures = 0;
+static _Atomic uint64_t ads_start_failures = 0;
+static _Atomic uint64_t drdy_timeouts = 0;
+static _Atomic uint64_t rdata_failures = 0;
 
 
 static void on_signal(int signo)
@@ -230,10 +258,11 @@ static void update_max_atomic(_Atomic uint64_t *target, uint64_t value)
     }
 }
 
-static void record_excitation_edge_timing(uint64_t deadline_us)
+static void record_excitation_wake_timing(
+    uint64_t deadline_us,
+    uint64_t wake_us)
 {
-    uint64_t now = monotonic_us();
-    uint64_t late = now > deadline_us ? now - deadline_us : 0ULL;
+    uint64_t late = wake_us > deadline_us ? wake_us - deadline_us : 0ULL;
 
     atomic_fetch_add(&excitation_edges, 1ULL);
 
@@ -241,6 +270,28 @@ static void record_excitation_edge_timing(uint64_t deadline_us)
         atomic_fetch_add(&excitation_late_edges, 1ULL);
 
     update_max_atomic(&excitation_max_late_us, late);
+}
+
+static int set_phase_timed(
+    int high_phase,
+    uint64_t deadline_us)
+{
+    /* Measure scheduler wake lateness BEFORE the GPIO ioctl. */
+    uint64_t wake_us = monotonic_us();
+    record_excitation_wake_timing(deadline_us, wake_us);
+
+    uint64_t gpio_begin_us = monotonic_us();
+    int rc = high_phase ? set_phase_high() : set_phase_low();
+    uint64_t gpio_end_us = monotonic_us();
+
+    update_max_atomic(
+        &excitation_gpio_max_us,
+        gpio_end_us - gpio_begin_us);
+
+    if (rc < 0)
+        atomic_fetch_add(&excitation_gpio_failures, 1ULL);
+
+    return rc;
 }
 
 /*
@@ -280,13 +331,11 @@ static void *excitation_worker(void *unused)
         if (!running)
             break;
 
-        if (set_phase_high() < 0) {
+        if (set_phase_timed(1, cycle_start) < 0) {
             perror("excitation set_phase_high");
             running = 0;
             break;
         }
-
-        record_excitation_edge_timing(cycle_start);
 
         uint64_t low_deadline = cycle_start + HALF_PERIOD_US;
         sleep_until_us(low_deadline);
@@ -294,13 +343,11 @@ static void *excitation_worker(void *unused)
         if (!running)
             break;
 
-        if (set_phase_low() < 0) {
+        if (set_phase_timed(0, low_deadline) < 0) {
             perror("excitation set_phase_low");
             running = 0;
             break;
         }
-
-        record_excitation_edge_timing(low_deadline);
 
         cycle_start += PWM_PERIOD_US;
 
@@ -995,12 +1042,17 @@ static int ads_reset_restart_and_read_at_phase(
     uint64_t phase_offset_us,
     int32_t *raw)
 {
+    unsigned int phase_index =
+        phase_offset_us >= HALF_PERIOD_US ? 1U : 0U;
+    unsigned int diag_slot = channel * 2U + phase_index;
     /*
      * Perform the slow RESET/reconfigure portion first while the excitation
      * thread continues independently at 1 kHz.
      */
-    if (ads_reset_configure_channel(channel) < 0)
+    if (ads_reset_configure_channel(channel) < 0) {
+        atomic_fetch_add(&ads_reset_config_failures, 1ULL);
         return -1;
+    }
 
     /*
      * Then synchronize START to the next requested excitation phase.
@@ -1020,11 +1072,17 @@ static int ads_reset_restart_and_read_at_phase(
         ? actual_start_request_us - target
         : 0ULL;
 
-    if (phase_late_us > 100ULL) {
+    update_max_atomic(
+        &sample_phase_max_late_us[diag_slot],
+        phase_late_us);
+
+    if (phase_late_us > PHASE_LATE_REJECT_US) {
+        atomic_fetch_add(&sample_phase_rejects[diag_slot], 1ULL);
         return -1;
     }
 
     if (ads_command(ADS_CMD_START) < 0) {
+        atomic_fetch_add(&ads_start_failures, 1ULL);
         fprintf(stderr, "ADS START command failed\n");
         return -1;
     }
@@ -1032,6 +1090,7 @@ static int ads_reset_restart_and_read_at_phase(
     if (wait_drdy_status(DRDY_TIMEOUT_US) < 0) {
         static unsigned long timeout_count = 0;
         timeout_count++;
+        atomic_fetch_add(&drdy_timeouts, 1ULL);
 
         if (timeout_count == 1UL ||
             (timeout_count % 100UL) == 0UL) {
@@ -1044,6 +1103,7 @@ static int ads_reset_restart_and_read_at_phase(
     }
 
     if (ads_read_data(raw) < 0) {
+        atomic_fetch_add(&rdata_failures, 1ULL);
         fprintf(stderr, "ADS RDATA failed\n");
         return -1;
     }
@@ -1065,6 +1125,29 @@ static void accumulate_channel(
     channel->vcm_sum += (high + low) / 2;
     channel->vdiff_sum += (high - low) / 2;
     channel->sample_count++;
+
+    if (channel->stored_samples < REPORT_MAX_SAMPLES) {
+        channel->high_samples[channel->stored_samples] = channel->high_raw;
+        channel->low_samples[channel->stored_samples] = channel->low_raw;
+        channel->stored_samples++;
+    } else {
+        channel->dropped_samples++;
+    }
+
+    if (!channel->extrema_valid) {
+        channel->high_min = channel->high_max = channel->high_raw;
+        channel->low_min = channel->low_max = channel->low_raw;
+        channel->extrema_valid = 1;
+    } else {
+        if (channel->high_raw < channel->high_min)
+            channel->high_min = channel->high_raw;
+        if (channel->high_raw > channel->high_max)
+            channel->high_max = channel->high_raw;
+        if (channel->low_raw < channel->low_min)
+            channel->low_min = channel->low_raw;
+        if (channel->low_raw > channel->low_max)
+            channel->low_max = channel->low_raw;
+    }
 }
 
 static void reset_channel_average(
@@ -1075,6 +1158,198 @@ static void reset_channel_average(
     channel->vcm_sum = 0;
     channel->vdiff_sum = 0;
     channel->sample_count = 0;
+    channel->extrema_valid = 0;
+    channel->stored_samples = 0;
+    channel->dropped_samples = 0;
+}
+
+static int compare_int32(const void *a, const void *b)
+{
+    int32_t aa = *(const int32_t *)a;
+    int32_t bb = *(const int32_t *)b;
+    return (aa > bb) - (aa < bb);
+}
+
+static int64_t trimmed_mean_int32(
+    const int32_t *samples,
+    uint32_t count,
+    uint32_t trim_each_side)
+{
+    if (count == 0U)
+        return 0;
+
+    int32_t work[REPORT_MAX_SAMPLES];
+    if (count > REPORT_MAX_SAMPLES)
+        count = REPORT_MAX_SAMPLES;
+
+    memcpy(work, samples, count * sizeof(work[0]));
+    qsort(work, count, sizeof(work[0]), compare_int32);
+
+    uint32_t trim = trim_each_side;
+    if (2U * trim >= count)
+        trim = 0U;
+
+    int64_t sum = 0;
+    for (uint32_t i = trim; i < count - trim; ++i)
+        sum += work[i];
+
+    return sum / (int64_t)(count - 2U * trim);
+}
+
+static int32_t median_int32(const int32_t *samples, uint32_t count)
+{
+    if (count == 0U)
+        return 0;
+
+    int32_t work[REPORT_MAX_SAMPLES];
+    if (count > REPORT_MAX_SAMPLES)
+        count = REPORT_MAX_SAMPLES;
+
+    memcpy(work, samples, count * sizeof(work[0]));
+    qsort(work, count, sizeof(work[0]), compare_int32);
+
+    if ((count & 1U) != 0U)
+        return work[count / 2U];
+
+    return (int32_t)(((int64_t)work[count / 2U - 1U] +
+                      (int64_t)work[count / 2U]) / 2LL);
+}
+
+static int64_t mad_int32(
+    const int32_t *samples,
+    uint32_t count,
+    int32_t median)
+{
+    if (count == 0U)
+        return 0;
+
+    int32_t deviations[REPORT_MAX_SAMPLES];
+    if (count > REPORT_MAX_SAMPLES)
+        count = REPORT_MAX_SAMPLES;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t d = (int64_t)samples[i] - (int64_t)median;
+        if (d < 0)
+            d = -d;
+        if (d > INT32_MAX)
+            d = INT32_MAX;
+        deviations[i] = (int32_t)d;
+    }
+
+    return (int64_t)median_int32(deviations, count);
+}
+
+static int64_t adaptive_outlier_threshold(int64_t mad)
+{
+    int64_t threshold = OUTLIER_MAD_MULTIPLIER * mad;
+    if (threshold < OUTLIER_MIN_THRESHOLD_COUNTS)
+        threshold = OUTLIER_MIN_THRESHOLD_COUNTS;
+    return threshold;
+}
+
+static uint32_t count_far_from_median(
+    const int32_t *samples,
+    uint32_t count,
+    int32_t median,
+    int64_t threshold_counts)
+{
+    uint32_t outliers = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t delta = (int64_t)samples[i] - median;
+        if (delta < 0)
+            delta = -delta;
+        if (delta > threshold_counts)
+            outliers++;
+    }
+    return outliers;
+}
+
+struct robust_pair_average {
+    int64_t high_mean;
+    int64_t low_mean;
+    int64_t vdiff_mean;
+    uint32_t accepted;
+    uint32_t rejected;
+    int fallback_used;
+};
+
+/*
+ * Adaptive per-phase outlier rejection.
+ *
+ * HIGH and LOW each get their own robust threshold:
+ *     max(OUTLIER_MIN_THRESHOLD_COUNTS, OUTLIER_MAD_MULTIPLIER * MAD)
+ *
+ * A pair is rejected when either phase is outside its own threshold.  This is
+ * intentionally stricter than the earlier one-sided-only rule: the goal is to
+ * remove rare conversion/excitation glitches inside a phase, while MAD lets
+ * the threshold widen automatically when the real signal distribution widens.
+ *
+ * If too few pairs survive, fall back to the unfiltered mean rather than hide
+ * a genuine large movement or a broader hardware fault.
+ */
+static struct robust_pair_average robust_pair_mean(
+    const int32_t *high_samples,
+    const int32_t *low_samples,
+    uint32_t count,
+    int32_t high_median,
+    int32_t low_median,
+    int64_t high_threshold,
+    int64_t low_threshold)
+{
+    struct robust_pair_average r = {0};
+
+    if (count == 0U)
+        return r;
+    if (count > REPORT_MAX_SAMPLES)
+        count = REPORT_MAX_SAMPLES;
+
+    int64_t high_sum = 0;
+    int64_t low_sum = 0;
+    int64_t vdiff_sum = 0;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t dh = (int64_t)high_samples[i] - high_median;
+        int64_t dl = (int64_t)low_samples[i] - low_median;
+        if (dh < 0) dh = -dh;
+        if (dl < 0) dl = -dl;
+
+        int high_far = dh > high_threshold;
+        int low_far = dl > low_threshold;
+
+        if (high_far || low_far) {
+            r.rejected++;
+            continue;
+        }
+
+        int64_t high = high_samples[i];
+        int64_t low = low_samples[i];
+        high_sum += high;
+        low_sum += low;
+        vdiff_sum += (high - low) / 2LL;
+        r.accepted++;
+    }
+
+    /* Conservative safety fallback for real sensor motion / broad faults. */
+    if (r.accepted < OUTLIER_MIN_ACCEPTED_PAIRS ||
+        r.accepted * 2U < count) {
+        high_sum = 0;
+        low_sum = 0;
+        vdiff_sum = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            int64_t high = high_samples[i];
+            int64_t low = low_samples[i];
+            high_sum += high;
+            low_sum += low;
+            vdiff_sum += (high - low) / 2LL;
+        }
+        r.accepted = count;
+        r.fallback_used = 1;
+    }
+
+    r.high_mean = high_sum / (int64_t)r.accepted;
+    r.low_mean = low_sum / (int64_t)r.accepted;
+    r.vdiff_mean = vdiff_sum / (int64_t)r.accepted;
+    return r;
 }
 
 static int32_t code_to_uv(int64_t code)
@@ -1312,7 +1587,26 @@ int main(int argc, char **argv)
         "CH1_HIGH_raw,CH1_LOW_raw,CH1_VDIFF_raw_uV,"
         "CH1_VDIFF_mdeg,CH1_LPF_fitted_mdeg,CH1_LPF_fitted_mdeg_offset,"
         "CH2_HIGH_raw,CH2_LOW_raw,CH2_VDIFF_raw_uV,"
-        "CH2_VDIFF_mdeg,CH2_LPF_fitted_mdeg,CH2_LPF_fitted_mdeg_offset"
+        "CH2_VDIFF_mdeg,CH2_LPF_fitted_mdeg,CH2_LPF_fitted_mdeg_offset,"
+        "CH1_samples,CH1_HIGH_min,CH1_HIGH_max,CH1_LOW_min,CH1_LOW_max,"
+        "CH2_samples,CH2_HIGH_min,CH2_HIGH_max,CH2_LOW_min,CH2_LOW_max,"
+        "CH1_HIGH_trim,CH1_LOW_trim,CH1_VDIFF_trim_uV,CH1_VDIFF_trim_mdeg,"
+        "CH2_HIGH_trim,CH2_LOW_trim,CH2_VDIFF_trim_uV,CH2_VDIFF_trim_mdeg,"
+        "CH1_HIGH_MAD,CH1_LOW_MAD,CH2_HIGH_MAD,CH2_LOW_MAD,"
+        "CH1_HIGH_threshold,CH1_LOW_threshold,CH2_HIGH_threshold,CH2_LOW_threshold,"
+        "CH1_HIGH_outliers,CH1_LOW_outliers,CH2_HIGH_outliers,CH2_LOW_outliers,"
+        "CH1_reject_accepted,CH1_reject_rejected,CH1_reject_fallback,"
+        "CH2_reject_accepted,CH2_reject_rejected,CH2_reject_fallback,"
+        "CH1_VDIFF_unfiltered_uV,CH1_VDIFF_unfiltered_mdeg,"
+        "CH2_VDIFF_unfiltered_uV,CH2_VDIFF_unfiltered_mdeg,"
+        "CH1_stored,CH1_store_dropped,CH2_stored,CH2_store_dropped,"
+        "exc_edges,exc_late_edges,exc_wake_max_late_us,exc_gpio_max_us,exc_gpio_failures,"
+        "CH1_HIGH_phase_max_late_us,CH1_LOW_phase_max_late_us,"
+        "CH2_HIGH_phase_max_late_us,CH2_LOW_phase_max_late_us,"
+        "CH1_HIGH_phase_rejects,CH1_LOW_phase_rejects,"
+        "CH2_HIGH_phase_rejects,CH2_LOW_phase_rejects,"
+        "adc_failures,completed_pairs,ads_reset_config_failures,"
+        "ads_start_failures,drdy_timeouts,rdata_failures"
     );
 
     /*
@@ -1385,10 +1679,93 @@ int main(int argc, char **argv)
         int64_t ch2_vdiff_avg =
             channels[1].vdiff_sum / ch2_count;
 
-        int32_t ch1_vdiff_uv =
-            code_to_uv(ch1_vdiff_avg);
-        int32_t ch2_vdiff_uv =
-            code_to_uv(ch2_vdiff_avg);
+        int64_t ch1_high_trim = trimmed_mean_int32(
+            channels[0].high_samples, channels[0].stored_samples,
+            TRIM_SAMPLES_EACH_SIDE);
+        int64_t ch1_low_trim = trimmed_mean_int32(
+            channels[0].low_samples, channels[0].stored_samples,
+            TRIM_SAMPLES_EACH_SIDE);
+        int64_t ch2_high_trim = trimmed_mean_int32(
+            channels[1].high_samples, channels[1].stored_samples,
+            TRIM_SAMPLES_EACH_SIDE);
+        int64_t ch2_low_trim = trimmed_mean_int32(
+            channels[1].low_samples, channels[1].stored_samples,
+            TRIM_SAMPLES_EACH_SIDE);
+
+        int64_t ch1_vdiff_trim = (ch1_high_trim - ch1_low_trim) / 2LL;
+        int64_t ch2_vdiff_trim = (ch2_high_trim - ch2_low_trim) / 2LL;
+        int32_t ch1_vdiff_trim_uv = code_to_uv(ch1_vdiff_trim);
+        int32_t ch2_vdiff_trim_uv = code_to_uv(ch2_vdiff_trim);
+        double ch1_vdiff_trim_mdeg =
+            ch1_vdiff_trim_uv / SENSOR_UV_PER_MDEG;
+        double ch2_vdiff_trim_mdeg =
+            ch2_vdiff_trim_uv / SENSOR_UV_PER_MDEG;
+
+        int32_t ch1_high_median = median_int32(
+            channels[0].high_samples, channels[0].stored_samples);
+        int32_t ch1_low_median = median_int32(
+            channels[0].low_samples, channels[0].stored_samples);
+        int32_t ch2_high_median = median_int32(
+            channels[1].high_samples, channels[1].stored_samples);
+        int32_t ch2_low_median = median_int32(
+            channels[1].low_samples, channels[1].stored_samples);
+
+        int64_t ch1_high_mad = mad_int32(
+            channels[0].high_samples, channels[0].stored_samples, ch1_high_median);
+        int64_t ch1_low_mad = mad_int32(
+            channels[0].low_samples, channels[0].stored_samples, ch1_low_median);
+        int64_t ch2_high_mad = mad_int32(
+            channels[1].high_samples, channels[1].stored_samples, ch2_high_median);
+        int64_t ch2_low_mad = mad_int32(
+            channels[1].low_samples, channels[1].stored_samples, ch2_low_median);
+
+        int64_t ch1_high_threshold = adaptive_outlier_threshold(ch1_high_mad);
+        int64_t ch1_low_threshold = adaptive_outlier_threshold(ch1_low_mad);
+        int64_t ch2_high_threshold = adaptive_outlier_threshold(ch2_high_mad);
+        int64_t ch2_low_threshold = adaptive_outlier_threshold(ch2_low_mad);
+
+        uint32_t ch1_high_outliers = count_far_from_median(
+            channels[0].high_samples, channels[0].stored_samples,
+            ch1_high_median, ch1_high_threshold);
+        uint32_t ch1_low_outliers = count_far_from_median(
+            channels[0].low_samples, channels[0].stored_samples,
+            ch1_low_median, ch1_low_threshold);
+        uint32_t ch2_high_outliers = count_far_from_median(
+            channels[1].high_samples, channels[1].stored_samples,
+            ch2_high_median, ch2_high_threshold);
+        uint32_t ch2_low_outliers = count_far_from_median(
+            channels[1].low_samples, channels[1].stored_samples,
+            ch2_low_median, ch2_low_threshold);
+
+        /*
+         * Apply adaptive median/MAD rejection to the value that feeds mdeg and
+         * the LPF. Keep the original unfiltered average in separate CSV columns
+         * for diagnostics.
+         */
+        struct robust_pair_average ch1_robust = robust_pair_mean(
+            channels[0].high_samples, channels[0].low_samples,
+            channels[0].stored_samples, ch1_high_median, ch1_low_median,
+            ch1_high_threshold, ch1_low_threshold);
+        struct robust_pair_average ch2_robust = robust_pair_mean(
+            channels[1].high_samples, channels[1].low_samples,
+            channels[1].stored_samples, ch2_high_median, ch2_low_median,
+            ch2_high_threshold, ch2_low_threshold);
+
+        int32_t ch1_vdiff_unfiltered_uv = code_to_uv(ch1_vdiff_avg);
+        int32_t ch2_vdiff_unfiltered_uv = code_to_uv(ch2_vdiff_avg);
+        double ch1_vdiff_unfiltered_mdeg =
+            ch1_vdiff_unfiltered_uv / SENSOR_UV_PER_MDEG;
+        double ch2_vdiff_unfiltered_mdeg =
+            ch2_vdiff_unfiltered_uv / SENSOR_UV_PER_MDEG;
+
+        /* Existing output columns now carry the outlier-rejected values. */
+        ch1_high_avg = ch1_robust.high_mean;
+        ch1_low_avg = ch1_robust.low_mean;
+        ch2_high_avg = ch2_robust.high_mean;
+        ch2_low_avg = ch2_robust.low_mean;
+
+        int32_t ch1_vdiff_uv = code_to_uv(ch1_robust.vdiff_mean);
+        int32_t ch2_vdiff_uv = code_to_uv(ch2_robust.vdiff_mean);
 
         double ch1_angle_mdeg =
             ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
@@ -1432,6 +1809,36 @@ int main(int argc, char **argv)
 
         int board_temp_mC = read_board_temp_mC();
 
+        /* Snapshot-and-reset report diagnostics only when a CSV row is emitted. */
+        uint64_t report_exc_edges =
+            atomic_exchange(&excitation_edges, 0ULL);
+        uint64_t report_exc_late_edges =
+            atomic_exchange(&excitation_late_edges, 0ULL);
+        uint64_t report_exc_max_late_us =
+            atomic_exchange(&excitation_max_late_us, 0ULL);
+        uint64_t report_exc_gpio_max_us =
+            atomic_exchange(&excitation_gpio_max_us, 0ULL);
+        uint64_t report_exc_gpio_failures =
+            atomic_exchange(&excitation_gpio_failures, 0ULL);
+
+        uint64_t report_phase_max_late_us[4];
+        uint64_t report_phase_rejects[4];
+        for (unsigned int i = 0; i < 4U; ++i) {
+            report_phase_max_late_us[i] =
+                atomic_exchange(&sample_phase_max_late_us[i], 0ULL);
+            report_phase_rejects[i] =
+                atomic_exchange(&sample_phase_rejects[i], 0ULL);
+        }
+
+        uint64_t report_reset_config_failures =
+            atomic_exchange(&ads_reset_config_failures, 0ULL);
+        uint64_t report_start_failures =
+            atomic_exchange(&ads_start_failures, 0ULL);
+        uint64_t report_drdy_timeouts =
+            atomic_exchange(&drdy_timeouts, 0ULL);
+        uint64_t report_rdata_failures =
+            atomic_exchange(&rdata_failures, 0ULL);
+
         if (board_temp_mC >= 0) {
             if (!temp_lpf_initialized) {
                 board_temp_lpf_mC = (double)board_temp_mC;
@@ -1445,14 +1852,28 @@ int main(int argc, char **argv)
             }
         }
 
-        char console_message[448];
+        char console_message[1024];
 
         int console_length = snprintf(
             console_message,
             sizeof(console_message),
             "%.3f,%d,%.1f,"
             "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
-            "%lld,%lld,%ld,%.3f,%.3f,%.3f\n",
+            "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
+            "%u,%ld,%ld,%ld,%ld,"
+            "%u,%ld,%ld,%ld,%ld,"
+            "%lld,%lld,%ld,%.3f,"
+            "%lld,%lld,%ld,%.3f,"
+            "%lld,%lld,%lld,%lld,"
+            "%lld,%lld,%lld,%lld,"
+            "%u,%u,%u,%u,"
+            "%u,%u,%d,%u,%u,%d,"
+            "%ld,%.3f,%ld,%.3f,"
+            "%u,%u,%u,%u,"
+            "%llu,%llu,%llu,%llu,%llu,"
+            "%llu,%llu,%llu,%llu,"
+            "%llu,%llu,%llu,%llu,"
+            "%llu,%llu,%llu,%llu,%llu,%llu\n",
 
             elapsed_time_s,
             board_temp_mC,
@@ -1470,7 +1891,83 @@ int main(int argc, char **argv)
             (long)ch2_vdiff_uv,
             ch2_angle_mdeg,
             ch2_lpf_mdeg,
-            ch2_lpf_mdeg_offset
+            ch2_lpf_mdeg_offset,
+
+            ch1_count,
+            (long)channels[0].high_min,
+            (long)channels[0].high_max,
+            (long)channels[0].low_min,
+            (long)channels[0].low_max,
+
+            ch2_count,
+            (long)channels[1].high_min,
+            (long)channels[1].high_max,
+            (long)channels[1].low_min,
+            (long)channels[1].low_max,
+
+            (long long)ch1_high_trim,
+            (long long)ch1_low_trim,
+            (long)ch1_vdiff_trim_uv,
+            ch1_vdiff_trim_mdeg,
+            (long long)ch2_high_trim,
+            (long long)ch2_low_trim,
+            (long)ch2_vdiff_trim_uv,
+            ch2_vdiff_trim_mdeg,
+
+            (long long)ch1_high_mad,
+            (long long)ch1_low_mad,
+            (long long)ch2_high_mad,
+            (long long)ch2_low_mad,
+
+            (long long)ch1_high_threshold,
+            (long long)ch1_low_threshold,
+            (long long)ch2_high_threshold,
+            (long long)ch2_low_threshold,
+
+            ch1_high_outliers,
+            ch1_low_outliers,
+            ch2_high_outliers,
+            ch2_low_outliers,
+
+            ch1_robust.accepted,
+            ch1_robust.rejected,
+            ch1_robust.fallback_used,
+            ch2_robust.accepted,
+            ch2_robust.rejected,
+            ch2_robust.fallback_used,
+
+            (long)ch1_vdiff_unfiltered_uv,
+            ch1_vdiff_unfiltered_mdeg,
+            (long)ch2_vdiff_unfiltered_uv,
+            ch2_vdiff_unfiltered_mdeg,
+
+            channels[0].stored_samples,
+            channels[0].dropped_samples,
+            channels[1].stored_samples,
+            channels[1].dropped_samples,
+
+            (unsigned long long)report_exc_edges,
+            (unsigned long long)report_exc_late_edges,
+            (unsigned long long)report_exc_max_late_us,
+            (unsigned long long)report_exc_gpio_max_us,
+            (unsigned long long)report_exc_gpio_failures,
+
+            (unsigned long long)report_phase_max_late_us[0],
+            (unsigned long long)report_phase_max_late_us[1],
+            (unsigned long long)report_phase_max_late_us[2],
+            (unsigned long long)report_phase_max_late_us[3],
+
+            (unsigned long long)report_phase_rejects[0],
+            (unsigned long long)report_phase_rejects[1],
+            (unsigned long long)report_phase_rejects[2],
+            (unsigned long long)report_phase_rejects[3],
+
+            (unsigned long long)adc_failures,
+            (unsigned long long)completed_pairs,
+            (unsigned long long)report_reset_config_failures,
+            (unsigned long long)report_start_failures,
+            (unsigned long long)report_drdy_timeouts,
+            (unsigned long long)report_rdata_failures
         );
 
         if (console_length > 0) {
@@ -1501,14 +1998,7 @@ int main(int argc, char **argv)
             );
         }
 
-        /*
-         * Keep the legacy-style console output clean: one CSV row per
-         * report interval.  Internal diagnostic counters are simply reset.
-         */
-        (void)atomic_exchange(&excitation_edges, 0ULL);
-        (void)atomic_exchange(&excitation_late_edges, 0ULL);
-        (void)atomic_exchange(&excitation_max_late_us, 0ULL);
-
+        /* Per-report non-atomic counters and channel accumulators. */
         adc_failures = 0;
         completed_pairs = 0;
 
