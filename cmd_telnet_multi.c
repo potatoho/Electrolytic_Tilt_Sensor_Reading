@@ -32,6 +32,8 @@
 #define PWM_EDGE_TIMEOUT_US 3000U
 #define REPORT_INTERVAL_US   1000000ULL
 #define LPF_TAU_SECONDS       5.0
+#define REPORT_SAMPLE_MAX      1024U
+#define REPORT_MEDIAN_WINDOW      3U
 
 #define TCP_MAX_CLIENTS        8
 #define TCP_RX_BUFFER_SIZE    128
@@ -119,6 +121,10 @@ struct channel_state {
     int64_t vdiff_sum;
 
     uint32_t sample_count;
+
+    /* Per-report paired-sample VDIFF history for sample-median filtering. */
+    int64_t vdiff_samples[REPORT_SAMPLE_MAX];
+    uint32_t stored_samples;
 };
 
 static volatile sig_atomic_t running = 1;
@@ -726,6 +732,16 @@ static void accumulate_channel(
     channel->vcm_sum += (high + low) / 2;
     channel->vdiff_sum += (high - low) / 2;
     channel->sample_count++;
+
+    /*
+     * Stage 1 median input:
+     * keep the paired HIGH/LOW differential for this 1-second report.
+     * Excitation/sampling timing is not changed.
+     */
+    if (channel->stored_samples < REPORT_SAMPLE_MAX) {
+        channel->vdiff_samples[channel->stored_samples++] =
+            (high - low) / 2;
+    }
 }
 
 static void reset_channel_average(
@@ -736,6 +752,70 @@ static void reset_channel_average(
     channel->vcm_sum = 0;
     channel->vdiff_sum = 0;
     channel->sample_count = 0;
+    channel->stored_samples = 0;
+}
+
+static int compare_int64(const void *a, const void *b)
+{
+    int64_t aa = *(const int64_t *)a;
+    int64_t bb = *(const int64_t *)b;
+    return (aa > bb) - (aa < bb);
+}
+
+static int64_t median_int64(const int64_t *samples, uint32_t count)
+{
+    if (count == 0U)
+        return 0;
+
+    if (count > REPORT_SAMPLE_MAX)
+        count = REPORT_SAMPLE_MAX;
+
+    int64_t work[REPORT_SAMPLE_MAX];
+    memcpy(work, samples, count * sizeof(work[0]));
+    qsort(work, count, sizeof(work[0]), compare_int64);
+
+    if ((count & 1U) != 0U)
+        return work[count / 2U];
+
+    return (work[count / 2U - 1U] + work[count / 2U]) / 2LL;
+}
+
+/*
+ * Stage 2 median:
+ * median of the most recent REPORT_MEDIAN_WINDOW report medians.
+ * With one/two reports available at startup, use the median of what exists.
+ */
+static int32_t push_report_median(
+    int32_t history[REPORT_MEDIAN_WINDOW],
+    uint32_t *count,
+    uint32_t *write_index,
+    int32_t value)
+{
+    history[*write_index] = value;
+    *write_index = (*write_index + 1U) % REPORT_MEDIAN_WINDOW;
+
+    if (*count < REPORT_MEDIAN_WINDOW)
+        (*count)++;
+
+    int32_t work[REPORT_MEDIAN_WINDOW];
+    for (uint32_t i = 0; i < *count; ++i)
+        work[i] = history[i];
+
+    for (uint32_t i = 1; i < *count; ++i) {
+        int32_t key = work[i];
+        uint32_t j = i;
+        while (j > 0U && work[j - 1U] > key) {
+            work[j] = work[j - 1U];
+            --j;
+        }
+        work[j] = key;
+    }
+
+    if ((*count & 1U) != 0U)
+        return work[*count / 2U];
+
+    return (int32_t)(((int64_t)work[*count / 2U - 1U] +
+                      (int64_t)work[*count / 2U]) / 2LL);
 }
 
 static int32_t code_to_uv(int64_t code)
@@ -1165,6 +1245,19 @@ int main(int argc, char **argv)
     int lpf_initialized = 0;
     int temp_lpf_initialized = 0;
 
+    /*
+     * Two-stage median filter state:
+     *   1) median of all paired VDIFF samples inside each report
+     *   2) median of the most recent 3 report medians
+     * The resulting value is the input to the existing LPF.
+     */
+    int32_t ch1_report_median_history[REPORT_MEDIAN_WINDOW] = {0};
+    int32_t ch2_report_median_history[REPORT_MEDIAN_WINDOW] = {0};
+    uint32_t ch1_report_median_count = 0U;
+    uint32_t ch2_report_median_count = 0U;
+    uint32_t ch1_report_median_index = 0U;
+    uint32_t ch2_report_median_index = 0U;
+
     if (retry_ads_select_channel(selected_channel) < 0)
         return EXIT_FAILURE;
 
@@ -1299,8 +1392,21 @@ int main(int argc, char **argv)
         int64_t ch1_low_avg =
             channels[0].low_sum / ch1_count;
 
-        int64_t ch1_vdiff_avg =
-            channels[0].vdiff_sum / ch1_count;
+        /*
+         * Stage 1: sample median.
+         * Use the median of every valid paired-sample VDIFF collected during
+         * this report interval.  HIGH/LOW averages remain available for the
+         * existing CSV diagnostics.
+         */
+        int64_t ch1_vdiff_sample_median =
+            median_int64(
+                channels[0].vdiff_samples,
+                channels[0].stored_samples);
+
+        int64_t ch2_vdiff_sample_median =
+            median_int64(
+                channels[1].vdiff_samples,
+                channels[1].stored_samples);
 
         int64_t ch2_high_avg =
             channels[1].high_sum / ch2_count;
@@ -1308,14 +1414,29 @@ int main(int argc, char **argv)
         int64_t ch2_low_avg =
             channels[1].low_sum / ch2_count;
 
-        int64_t ch2_vdiff_avg =
-            channels[1].vdiff_sum / ch2_count;
-
         int32_t ch1_vdiff_uv =
-            code_to_uv(ch1_vdiff_avg);
+            code_to_uv(ch1_vdiff_sample_median);
 
         int32_t ch2_vdiff_uv =
-            code_to_uv(ch2_vdiff_avg);
+            code_to_uv(ch2_vdiff_sample_median);
+
+        /*
+         * Stage 2: report median.
+         * Suppress a one-report excursion before the existing LPF.
+         */
+        int32_t ch1_report_median_uv =
+            push_report_median(
+                ch1_report_median_history,
+                &ch1_report_median_count,
+                &ch1_report_median_index,
+                ch1_vdiff_uv);
+
+        int32_t ch2_report_median_uv =
+            push_report_median(
+                ch2_report_median_history,
+                &ch2_report_median_count,
+                &ch2_report_median_index,
+                ch2_vdiff_uv);
 
         double ch1_angle_mdeg =
             ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
@@ -1327,16 +1448,16 @@ int main(int argc, char **argv)
             (double)(now - last_report) / 1000000.0;
 
         if (!lpf_initialized) {
-            ch1_vdiff_lpf_uv = (double)ch1_vdiff_uv;
-            ch2_vdiff_lpf_uv = (double)ch2_vdiff_uv;
+            ch1_vdiff_lpf_uv = (double)ch1_report_median_uv;
+            ch2_vdiff_lpf_uv = (double)ch2_report_median_uv;
             lpf_initialized = 1;
         } else {
             double alpha = dt / (LPF_TAU_SECONDS + dt);
 
             ch1_vdiff_lpf_uv +=
-                alpha * ((double)ch1_vdiff_uv - ch1_vdiff_lpf_uv);
+                alpha * ((double)ch1_report_median_uv - ch1_vdiff_lpf_uv);
             ch2_vdiff_lpf_uv +=
-                alpha * ((double)ch2_vdiff_uv - ch2_vdiff_lpf_uv);
+                alpha * ((double)ch2_report_median_uv - ch2_vdiff_lpf_uv);
         }
 
         double ch1_lpf_input_mdeg =
