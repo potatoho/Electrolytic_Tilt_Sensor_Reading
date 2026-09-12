@@ -31,9 +31,28 @@
 #define DRDY_TIMEOUT_US      250U
 #define PWM_EDGE_TIMEOUT_US 3000U
 #define REPORT_INTERVAL_US   1000000ULL
-#define LPF_TAU_SECONDS       5.0
+#define LPF_TAU_SECONDS       2.0
 #define REPORT_SAMPLE_MAX      1024U
 #define REPORT_MEDIAN_WINDOW      3U
+#define OUTLIER_MIN_THRESHOLD_COUNTS 2000LL
+#define OUTLIER_MAD_MULTIPLIER       6LL
+#define OUTLIER_MIN_ACCEPTED_PAIRS     8U
+#define REPORT_MIN_VALID_PAIRS        20U
+#define ADS_RESET_SETTLE_US          200U
+
+/* Per-channel electrical-spike detector, evaluated once per 1-s report.
+ * D  = HIGH - LOW
+ * CM = (HIGH + LOW) / 2
+ * Same detector and thresholds are applied independently to CH1 and CH2.
+ */
+#define SPIKE_D_MIN_COUNTS              7000LL
+#define SPIKE_CM_MIN_COUNTS             2000LL
+#define SPIKE_CM_D_RATIO_NUM               8LL  /* 0.08 = 8 / 100 */
+#define SPIKE_CM_D_RATIO_DEN             100LL
+#define SPIKE_REJECT_MAX_REPORTS           15U
+#define SPIKE_RELEASE_GOOD_REPORTS            2U
+#define SPIKE_RELEASE_GUARD_REPORTS           2U
+#define SPIKE_FAULT_RECOVERY_REPORTS         8U
 
 #define TCP_MAX_CLIENTS        8
 #define TCP_RX_BUFFER_SIZE    128
@@ -122,10 +141,165 @@ struct channel_state {
 
     uint32_t sample_count;
 
-    /* Per-report paired-sample VDIFF history for sample-median filtering. */
-    int64_t vdiff_samples[REPORT_SAMPLE_MAX];
+    /* Per-report paired HIGH/LOW history for robust median/MAD filtering. */
+    int32_t high_samples[REPORT_SAMPLE_MAX];
+    int32_t low_samples[REPORT_SAMPLE_MAX];
     uint32_t stored_samples;
+    uint32_t dropped_samples;
 };
+
+struct spike_filter_state {
+    int initialized;
+    int rejecting;
+    int fault;
+
+    int64_t previous_d;
+    int64_t previous_cm;
+    int64_t reference_cm;
+
+    uint32_t reject_reports;
+    uint32_t release_good_reports;
+    uint32_t release_guard_reports;
+    uint32_t recovery_good_reports;
+};
+
+struct spike_filter_result {
+    int reject;
+    int fault;
+    int edge;
+    int64_t d;
+    int64_t cm;
+    int64_t delta_d;
+    int64_t delta_cm;
+};
+
+static int64_t abs_i64(int64_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+/*
+ * Common, per-channel electrical-spike discriminator.
+ * No CH1/CH2 cross-comparison and no tilt-speed limit are used.
+ */
+static struct spike_filter_result update_spike_filter(
+    struct spike_filter_state *state,
+    int64_t high,
+    int64_t low)
+{
+    struct spike_filter_result result = {0};
+
+    int64_t d = high - low;
+    int64_t cm = (high + low) / 2LL;
+    result.d = d;
+    result.cm = cm;
+
+    if (!state->initialized) {
+        state->initialized = 1;
+        state->previous_d = d;
+        state->previous_cm = cm;
+        state->reference_cm = cm;
+        return result;
+    }
+
+    int64_t delta_d = d - state->previous_d;
+    int64_t delta_cm = cm - state->previous_cm;
+    int64_t abs_delta_d = abs_i64(delta_d);
+    int64_t abs_delta_cm = abs_i64(delta_cm);
+
+    result.delta_d = delta_d;
+    result.delta_cm = delta_cm;
+
+    result.edge =
+        abs_delta_d > SPIKE_D_MIN_COUNTS &&
+        abs_delta_cm > SPIKE_CM_MIN_COUNTS &&
+        abs_delta_cm * SPIKE_CM_D_RATIO_DEN >
+            abs_delta_d * SPIKE_CM_D_RATIO_NUM;
+
+    if (state->fault) {
+        int electrically_stable =
+            !result.edge &&
+            abs_delta_cm <= SPIKE_CM_MIN_COUNTS;
+
+        if (electrically_stable) {
+            state->recovery_good_reports++;
+            if (state->recovery_good_reports >=
+                SPIKE_FAULT_RECOVERY_REPORTS) {
+                state->fault = 0;
+                state->rejecting = 0;
+                state->reject_reports = 0U;
+                state->release_good_reports = 0U;
+                state->release_guard_reports = 0U;
+                state->recovery_good_reports = 0U;
+                state->reference_cm = cm;
+            }
+        } else {
+            state->recovery_good_reports = 0U;
+        }
+
+        result.fault = state->fault;
+        result.reject = state->fault;
+    } else if (state->rejecting) {
+        state->reject_reports++;
+
+        int release_candidate =
+            !result.edge &&
+            abs_i64(cm - state->reference_cm) <= SPIKE_CM_MIN_COUNTS;
+
+        if (state->release_guard_reports > 0U) {
+            if (result.edge) {
+                state->release_guard_reports = 0U;
+                state->release_good_reports = 0U;
+                result.reject = 1;
+            } else {
+                state->release_guard_reports--;
+                result.reject = 1;
+
+                if (state->release_guard_reports == 0U) {
+                    state->rejecting = 0;
+                    state->reject_reports = 0U;
+                    state->release_good_reports = 0U;
+                    state->reference_cm = cm;
+                }
+            }
+        } else if (release_candidate) {
+            state->release_good_reports++;
+            result.reject = 1;
+
+            if (state->release_good_reports >=
+                SPIKE_RELEASE_GOOD_REPORTS) {
+                state->release_good_reports = 0U;
+                state->release_guard_reports =
+                    SPIKE_RELEASE_GUARD_REPORTS;
+            }
+        } else {
+            state->release_good_reports = 0U;
+            state->release_guard_reports = 0U;
+
+            if (state->reject_reports >= SPIKE_REJECT_MAX_REPORTS) {
+                state->fault = 1;
+                state->recovery_good_reports = 0U;
+                result.reject = 1;
+                result.fault = 1;
+            } else {
+                result.reject = 1;
+            }
+        }
+    } else if (result.edge) {
+        state->rejecting = 1;
+        state->reject_reports = 1U;
+        state->release_good_reports = 0U;
+        state->release_guard_reports = 0U;
+        state->reference_cm = state->previous_cm;
+        result.reject = 1;
+    }
+
+    state->previous_d = d;
+    state->previous_cm = cm;
+    result.fault = state->fault;
+
+    return result;
+}
 
 static volatile sig_atomic_t running = 1;
 
@@ -137,6 +311,13 @@ static volatile uint32_t *pwm_regs;
 static volatile uint32_t *clk_regs;
 static uint32_t saved_gpfsel1;
 static int pwm_gpio_configured;
+
+/* ADC/SPI recovery diagnostics. Single-threaded on Pi4, so atomics are not required. */
+static uint64_t ads_start_failures = 0;
+static uint64_t drdy_timeouts = 0;
+static uint64_t rdata_failures = 0;
+static uint64_t ads_recovery_attempts = 0;
+static uint64_t ads_recovery_failures = 0;
 
 static void on_signal(int signo)
 {
@@ -455,12 +636,21 @@ static int ads_transaction(
     uint8_t *rx,
     size_t len)
 {
+    /* Force both CS lines inactive before changing devices and provide a
+     * small setup/hold margin around each transaction.  This protects against
+     * rare CS1/CS2 switching failures without changing the PWM excitation.
+     */
+    deselect_cs();
+    usleep(2);
+
     if (select_cs(cs) < 0)
         return -1;
 
+    usleep(1);
     int rc = spi_transfer(tx, rx, len);
-
+    usleep(1);
     deselect_cs();
+    usleep(2);
 
     return rc;
 }
@@ -710,15 +900,55 @@ static int retry_ads_select_channel(unsigned int channel)
     return -1;
 }
 
-static int ads_restart_and_read(int32_t *raw)
+static int ads_recover_channel(unsigned int channel)
 {
-    if (ads_command(ADS_CMD_START) < 0)
-        return -1;
+    uint8_t mux = channel == 0U
+        ? ADS_MODE4_MUX_AIN0_AINCOM
+        : ADS_MODE4_MUX_AIN1_AINCOM;
 
-    if (wait_drdy_falling_edge(DRDY_TIMEOUT_US) < 0)
-        return -1;
+    ads_recovery_attempts++;
+    deselect_cs();
+    usleep(10);
 
-    return ads_read_data(raw);
+    if (ads_command(ADS_CMD_RESET) < 0) {
+        ads_recovery_failures++;
+        return -1;
+    }
+
+    usleep(ADS_RESET_SETTLE_US);
+
+    if (ads_write_reg(ADS_REG_MODE3, ADS_MODE3_STATUS_OFF) < 0 ||
+        ads_write_reg(ADS_REG_MODE0, ADS_MODE0_40000SPS) < 0 ||
+        ads_write_reg(ADS_REG_MODE1, ADS_MODE1_CONTINUOUS_DELAY_50US) < 0 ||
+        ads_write_reg(ADS_REG_MODE4, mux | ADS_MODE4_GAIN_1) < 0) {
+        ads_recovery_failures++;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int ads_restart_and_read(unsigned int channel, int32_t *raw)
+{
+    if (ads_command(ADS_CMD_START) < 0) {
+        ads_start_failures++;
+        (void)ads_recover_channel(channel);
+        return -1;
+    }
+
+    if (wait_drdy_falling_edge(DRDY_TIMEOUT_US) < 0) {
+        drdy_timeouts++;
+        (void)ads_recover_channel(channel);
+        return -1;
+    }
+
+    if (ads_read_data(raw) < 0) {
+        rdata_failures++;
+        (void)ads_recover_channel(channel);
+        return -1;
+    }
+
+    return 0;
 }
 
 static void accumulate_channel(
@@ -733,14 +963,13 @@ static void accumulate_channel(
     channel->vdiff_sum += (high - low) / 2;
     channel->sample_count++;
 
-    /*
-     * Stage 1 median input:
-     * keep the paired HIGH/LOW differential for this 1-second report.
-     * Excitation/sampling timing is not changed.
-     */
+    /* Keep each valid HIGH/LOW pair for report-level robust filtering. */
     if (channel->stored_samples < REPORT_SAMPLE_MAX) {
-        channel->vdiff_samples[channel->stored_samples++] =
-            (high - low) / 2;
+        channel->high_samples[channel->stored_samples] = channel->high_raw;
+        channel->low_samples[channel->stored_samples] = channel->low_raw;
+        channel->stored_samples++;
+    } else {
+        channel->dropped_samples++;
     }
 }
 
@@ -753,6 +982,32 @@ static void reset_channel_average(
     channel->vdiff_sum = 0;
     channel->sample_count = 0;
     channel->stored_samples = 0;
+    channel->dropped_samples = 0;
+}
+
+static int compare_int32(const void *a, const void *b)
+{
+    int32_t aa = *(const int32_t *)a;
+    int32_t bb = *(const int32_t *)b;
+    return (aa > bb) - (aa < bb);
+}
+
+static int32_t median_int32(const int32_t *samples, uint32_t count)
+{
+    if (count == 0U)
+        return 0;
+    if (count > REPORT_SAMPLE_MAX)
+        count = REPORT_SAMPLE_MAX;
+
+    int32_t work[REPORT_SAMPLE_MAX];
+    memcpy(work, samples, count * sizeof(work[0]));
+    qsort(work, count, sizeof(work[0]), compare_int32);
+
+    if ((count & 1U) != 0U)
+        return work[count / 2U];
+
+    return (int32_t)(((int64_t)work[count / 2U - 1U] +
+                      (int64_t)work[count / 2U]) / 2LL);
 }
 
 static int compare_int64(const void *a, const void *b)
@@ -766,7 +1021,6 @@ static int64_t median_int64(const int64_t *samples, uint32_t count)
 {
     if (count == 0U)
         return 0;
-
     if (count > REPORT_SAMPLE_MAX)
         count = REPORT_SAMPLE_MAX;
 
@@ -778,6 +1032,131 @@ static int64_t median_int64(const int64_t *samples, uint32_t count)
         return work[count / 2U];
 
     return (work[count / 2U - 1U] + work[count / 2U]) / 2LL;
+}
+
+static int64_t mad_int32(
+    const int32_t *samples,
+    uint32_t count,
+    int32_t median)
+{
+    if (count == 0U)
+        return 0;
+    if (count > REPORT_SAMPLE_MAX)
+        count = REPORT_SAMPLE_MAX;
+
+    int32_t deviations[REPORT_SAMPLE_MAX];
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t d = (int64_t)samples[i] - median;
+        if (d < 0) d = -d;
+        if (d > INT32_MAX) d = INT32_MAX;
+        deviations[i] = (int32_t)d;
+    }
+
+    return (int64_t)median_int32(deviations, count);
+}
+
+static int64_t adaptive_outlier_threshold(int64_t mad)
+{
+    int64_t threshold = OUTLIER_MAD_MULTIPLIER * mad;
+    if (threshold < OUTLIER_MIN_THRESHOLD_COUNTS)
+        threshold = OUTLIER_MIN_THRESHOLD_COUNTS;
+    return threshold;
+}
+
+struct robust_pair_average {
+    int64_t high_mean;
+    int64_t low_mean;
+    uint32_t accepted;
+    uint32_t rejected;
+    int fallback_used;
+};
+
+static struct robust_pair_average robust_pair_mean(
+    const int32_t *high_samples,
+    const int32_t *low_samples,
+    uint32_t count,
+    int32_t high_median,
+    int32_t low_median,
+    int64_t high_threshold,
+    int64_t low_threshold)
+{
+    struct robust_pair_average r = {0};
+    if (count == 0U)
+        return r;
+    if (count > REPORT_SAMPLE_MAX)
+        count = REPORT_SAMPLE_MAX;
+
+    int64_t hs = 0;
+    int64_t ls = 0;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t dh = (int64_t)high_samples[i] - high_median;
+        int64_t dl = (int64_t)low_samples[i] - low_median;
+        if (dh < 0) dh = -dh;
+        if (dl < 0) dl = -dl;
+
+        if (dh > high_threshold || dl > low_threshold) {
+            r.rejected++;
+            continue;
+        }
+
+        hs += high_samples[i];
+        ls += low_samples[i];
+        r.accepted++;
+    }
+
+    if (r.accepted < OUTLIER_MIN_ACCEPTED_PAIRS ||
+        r.accepted * 2U < count) {
+        hs = 0;
+        ls = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            hs += high_samples[i];
+            ls += low_samples[i];
+        }
+        r.accepted = count;
+        r.fallback_used = 1;
+    }
+
+    if (r.accepted > 0U) {
+        r.high_mean = hs / (int64_t)r.accepted;
+        r.low_mean = ls / (int64_t)r.accepted;
+    }
+    return r;
+}
+
+static int64_t robust_pair_vdiff_median(
+    const int32_t *high_samples,
+    const int32_t *low_samples,
+    uint32_t count,
+    int32_t high_median,
+    int32_t low_median,
+    int64_t high_threshold,
+    int64_t low_threshold,
+    uint32_t *accepted_out)
+{
+    if (count > REPORT_SAMPLE_MAX)
+        count = REPORT_SAMPLE_MAX;
+
+    int64_t vdiff_samples[REPORT_SAMPLE_MAX];
+    uint32_t accepted = 0U;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int64_t dh = (int64_t)high_samples[i] - high_median;
+        int64_t dl = (int64_t)low_samples[i] - low_median;
+        if (dh < 0) dh = -dh;
+        if (dl < 0) dl = -dl;
+        if (dh > high_threshold || dl > low_threshold)
+            continue;
+
+        vdiff_samples[accepted++] =
+            ((int64_t)high_samples[i] - (int64_t)low_samples[i]) / 2LL;
+    }
+
+    if (accepted_out != NULL)
+        *accepted_out = accepted;
+    if (accepted == 0U)
+        return 0;
+    return median_int64(vdiff_samples, accepted);
 }
 
 /*
@@ -1242,8 +1621,10 @@ int main(int argc, char **argv)
     double ch1_vdiff_lpf_uv = 0.0;
     double ch2_vdiff_lpf_uv = 0.0;
     double board_temp_lpf_mC = -1.0;
-    int lpf_initialized = 0;
+    int ch1_lpf_initialized = 0;
+    int ch2_lpf_initialized = 0;
     int temp_lpf_initialized = 0;
+    struct spike_filter_state spike_state[2] = {{0}, {0}};
 
     /*
      * Two-stage median filter state:
@@ -1316,7 +1697,7 @@ int main(int argc, char **argv)
     );
 
     if (pwm1_level() == 1 &&
-        ads_restart_and_read(&channel->high_raw) == 0 &&
+        ads_restart_and_read(selected_channel, &channel->high_raw) == 0 &&
         pwm1_level() == 1) {
         valid_high = 1;
     }
@@ -1340,7 +1721,7 @@ int main(int argc, char **argv)
     );
 
     if (pwm1_level() == 0 &&
-        ads_restart_and_read(&channel->low_raw) == 0 &&
+        ads_restart_and_read(selected_channel, &channel->low_raw) == 0 &&
         pwm1_level() == 0) {
         valid_low = 1;
     }
@@ -1386,57 +1767,56 @@ int main(int argc, char **argv)
         uint32_t ch2_count =
             channels[1].sample_count;
 
-        int64_t ch1_high_avg =
-            channels[0].high_sum / ch1_count;
+        uint32_t ch1_stored = channels[0].stored_samples;
+        uint32_t ch2_stored = channels[1].stored_samples;
 
-        int64_t ch1_low_avg =
-            channels[0].low_sum / ch1_count;
+        int32_t ch1_high_median =
+            median_int32(channels[0].high_samples, ch1_stored);
+        int32_t ch1_low_median =
+            median_int32(channels[0].low_samples, ch1_stored);
+        int32_t ch2_high_median =
+            median_int32(channels[1].high_samples, ch2_stored);
+        int32_t ch2_low_median =
+            median_int32(channels[1].low_samples, ch2_stored);
 
-        /*
-         * Stage 1: sample median.
-         * Use the median of every valid paired-sample VDIFF collected during
-         * this report interval.  HIGH/LOW averages remain available for the
-         * existing CSV diagnostics.
-         */
-        int64_t ch1_vdiff_sample_median =
-            median_int64(
-                channels[0].vdiff_samples,
-                channels[0].stored_samples);
+        int64_t ch1_high_threshold = adaptive_outlier_threshold(
+            mad_int32(channels[0].high_samples, ch1_stored, ch1_high_median));
+        int64_t ch1_low_threshold = adaptive_outlier_threshold(
+            mad_int32(channels[0].low_samples, ch1_stored, ch1_low_median));
+        int64_t ch2_high_threshold = adaptive_outlier_threshold(
+            mad_int32(channels[1].high_samples, ch2_stored, ch2_high_median));
+        int64_t ch2_low_threshold = adaptive_outlier_threshold(
+            mad_int32(channels[1].low_samples, ch2_stored, ch2_low_median));
 
-        int64_t ch2_vdiff_sample_median =
-            median_int64(
-                channels[1].vdiff_samples,
-                channels[1].stored_samples);
+        struct robust_pair_average ch1_robust = robust_pair_mean(
+            channels[0].high_samples, channels[0].low_samples, ch1_stored,
+            ch1_high_median, ch1_low_median,
+            ch1_high_threshold, ch1_low_threshold);
+        struct robust_pair_average ch2_robust = robust_pair_mean(
+            channels[1].high_samples, channels[1].low_samples, ch2_stored,
+            ch2_high_median, ch2_low_median,
+            ch2_high_threshold, ch2_low_threshold);
 
-        int64_t ch2_high_avg =
-            channels[1].high_sum / ch2_count;
+        uint32_t ch1_median_accepted = 0U;
+        uint32_t ch2_median_accepted = 0U;
+        int64_t ch1_vdiff_sample_median = robust_pair_vdiff_median(
+            channels[0].high_samples, channels[0].low_samples, ch1_stored,
+            ch1_high_median, ch1_low_median,
+            ch1_high_threshold, ch1_low_threshold,
+            &ch1_median_accepted);
+        int64_t ch2_vdiff_sample_median = robust_pair_vdiff_median(
+            channels[1].high_samples, channels[1].low_samples, ch2_stored,
+            ch2_high_median, ch2_low_median,
+            ch2_high_threshold, ch2_low_threshold,
+            &ch2_median_accepted);
 
-        int64_t ch2_low_avg =
-            channels[1].low_sum / ch2_count;
+        int64_t ch1_high_avg = ch1_robust.high_mean;
+        int64_t ch1_low_avg = ch1_robust.low_mean;
+        int64_t ch2_high_avg = ch2_robust.high_mean;
+        int64_t ch2_low_avg = ch2_robust.low_mean;
 
-        int32_t ch1_vdiff_uv =
-            code_to_uv(ch1_vdiff_sample_median);
-
-        int32_t ch2_vdiff_uv =
-            code_to_uv(ch2_vdiff_sample_median);
-
-        /*
-         * Stage 2: report median.
-         * Suppress a one-report excursion before the existing LPF.
-         */
-        int32_t ch1_report_median_uv =
-            push_report_median(
-                ch1_report_median_history,
-                &ch1_report_median_count,
-                &ch1_report_median_index,
-                ch1_vdiff_uv);
-
-        int32_t ch2_report_median_uv =
-            push_report_median(
-                ch2_report_median_history,
-                &ch2_report_median_count,
-                &ch2_report_median_index,
-                ch2_vdiff_uv);
+        int32_t ch1_vdiff_uv = code_to_uv(ch1_vdiff_sample_median);
+        int32_t ch2_vdiff_uv = code_to_uv(ch2_vdiff_sample_median);
 
         double ch1_angle_mdeg =
             ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
@@ -1446,18 +1826,73 @@ int main(int argc, char **argv)
 
         double dt =
             (double)(now - last_report) / 1000000.0;
+        double alpha = dt / (LPF_TAU_SECONDS + dt);
 
-        if (!lpf_initialized) {
-            ch1_vdiff_lpf_uv = (double)ch1_report_median_uv;
-            ch2_vdiff_lpf_uv = (double)ch2_report_median_uv;
-            lpf_initialized = 1;
-        } else {
-            double alpha = dt / (LPF_TAU_SECONDS + dt);
+        /*
+         * Basic electrical-spike detector.  CH1 and CH2 use exactly the same
+         * thresholds but independent state machines.  A rejected report is
+         * NOT inserted into the 3-report median history, and the channel LPF
+         * state is held at the last accepted value.
+         */
+        int ch1_report_valid =
+            !ch1_robust.fallback_used &&
+            ch1_robust.accepted >= REPORT_MIN_VALID_PAIRS &&
+            ch1_median_accepted >= REPORT_MIN_VALID_PAIRS;
+        int ch2_report_valid =
+            !ch2_robust.fallback_used &&
+            ch2_robust.accepted >= REPORT_MIN_VALID_PAIRS &&
+            ch2_median_accepted >= REPORT_MIN_VALID_PAIRS;
 
-            ch1_vdiff_lpf_uv +=
-                alpha * ((double)ch1_report_median_uv - ch1_vdiff_lpf_uv);
-            ch2_vdiff_lpf_uv +=
-                alpha * ((double)ch2_report_median_uv - ch2_vdiff_lpf_uv);
+        struct spike_filter_result ch1_spike = {
+            .reject = spike_state[0].rejecting || spike_state[0].fault,
+            .fault = spike_state[0].fault,
+            .edge = 0
+        };
+        struct spike_filter_result ch2_spike = {
+            .reject = spike_state[1].rejecting || spike_state[1].fault,
+            .fault = spike_state[1].fault,
+            .edge = 0
+        };
+
+        if (ch1_report_valid)
+            ch1_spike = update_spike_filter(
+                &spike_state[0], ch1_high_avg, ch1_low_avg);
+        if (ch2_report_valid)
+            ch2_spike = update_spike_filter(
+                &spike_state[1], ch2_high_avg, ch2_low_avg);
+
+        if (ch1_report_valid && !ch1_spike.reject && !ch1_spike.fault) {
+            int32_t ch1_report_median_uv =
+                push_report_median(
+                    ch1_report_median_history,
+                    &ch1_report_median_count,
+                    &ch1_report_median_index,
+                    ch1_vdiff_uv);
+
+            if (!ch1_lpf_initialized) {
+                ch1_vdiff_lpf_uv = (double)ch1_report_median_uv;
+                ch1_lpf_initialized = 1;
+            } else {
+                ch1_vdiff_lpf_uv +=
+                    alpha * ((double)ch1_report_median_uv - ch1_vdiff_lpf_uv);
+            }
+        }
+
+        if (ch2_report_valid && !ch2_spike.reject && !ch2_spike.fault) {
+            int32_t ch2_report_median_uv =
+                push_report_median(
+                    ch2_report_median_history,
+                    &ch2_report_median_count,
+                    &ch2_report_median_index,
+                    ch2_vdiff_uv);
+
+            if (!ch2_lpf_initialized) {
+                ch2_vdiff_lpf_uv = (double)ch2_report_median_uv;
+                ch2_lpf_initialized = 1;
+            } else {
+                ch2_vdiff_lpf_uv +=
+                    alpha * ((double)ch2_report_median_uv - ch2_vdiff_lpf_uv);
+            }
         }
 
         double ch1_lpf_input_mdeg =
@@ -1540,10 +1975,14 @@ int main(int argc, char **argv)
 
         fprintf(
             stderr,
-            "averaged samples: CH1=%u, CH2=%u, skipped ADC cycles=%llu\n",
+            "averaged samples: CH1=%u, CH2=%u, skipped ADC cycles=%llu, "
+            "spike CH1(edge=%d reject=%d fault=%d), "
+            "CH2(edge=%d reject=%d fault=%d)\n",
             ch1_count,
             ch2_count,
-            (unsigned long long)missed_cycles
+            (unsigned long long)missed_cycles,
+            ch1_spike.edge, ch1_spike.reject, ch1_spike.fault,
+            ch2_spike.edge, ch2_spike.reject, ch2_spike.fault
         );
 
         missed_cycles = 0;
