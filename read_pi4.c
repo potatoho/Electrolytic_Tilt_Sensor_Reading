@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <linux/gpio.h>
 #include <linux/spi/spidev.h>
+#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,11 +28,18 @@
 
 #define PWM_PERIOD_US       1000ULL
 #define HALF_PERIOD_US       500ULL
-#define EXTERNAL_SETTLING_US 200U
-#define DRDY_TIMEOUT_US      250U
+#define EXTERNAL_SETTLING_US 100U
+#define DRDY_TIMEOUT_US      100U
+#define ADC_SAMPLE_PERIOD_US   25ULL
+#define ADS_RESET_SETTLE_US   50U
 #define PWM_EDGE_TIMEOUT_US 3000U
 #define REPORT_INTERVAL_US   1000000ULL
-#define LPF_TAU_SECONDS       5.0
+#define LPF_TAU_SECONDS       0.0
+
+#define PHASE_SAMPLE_COUNT       10U
+#define PHASE_KEEP_COUNT          5U
+#define OUTPUT_WINDOW_COUNT    1024U  /* storage capacity for one report interval */
+#define OUTPUT_TRIM_EACH_SIDE    10U
 
 /* Raspberry Pi 4 / BCM2711 peripheral addresses. */
 #define GPIO_BASE_PHYS     0xFE200000UL
@@ -69,11 +77,13 @@
 
 #define ADS_CMD_RESET      0x06U
 #define ADS_CMD_START      0x08U
+#define ADS_CMD_STOP       0x0AU
 #define ADS_CMD_RDATA      0x12U
 #define ADS_CMD_RREG       0x20U
 #define ADS_CMD_WREG       0x40U
 
 #define ADS_REG_ID         0x00U
+#define ADS_REG_STATUS0    0x01U
 #define ADS_REG_MODE0      0x02U
 #define ADS_REG_MODE1      0x03U
 #define ADS_REG_MODE3      0x05U
@@ -85,6 +95,7 @@
 #define ADS_MODE4_MUX_AIN1_AINCOM  0x20U
 #define ADS_MODE4_MUX_AIN0_AINCOM  0x30U
 #define ADS_MODE4_GAIN_1            0x04U
+#define ADS_STATUS0_DRDY             (1U << 2)
 
 #define ADS_CODE_FS        8388608LL
 #define ADS_VREF_UV        5000000LL
@@ -112,9 +123,9 @@ struct channel_state {
 
     int64_t high_sum;
     int64_t low_sum;
-    int64_t vcm_sum;
-    int64_t vdiff_sum;
 
+    /* One entry = VDIFF made from robust HIGH/LOW representatives. */
+    int64_t vdiff_window[OUTPUT_WINDOW_COUNT];
     uint32_t sample_count;
 };
 
@@ -128,6 +139,13 @@ static volatile uint32_t *pwm_regs;
 static volatile uint32_t *clk_regs;
 static uint32_t saved_gpfsel1;
 static int pwm_gpio_configured;
+
+static uint64_t diag_edge_fail = 0;
+static uint64_t diag_prelevel_fail = 0;
+static uint64_t diag_start_fail = 0;
+static uint64_t diag_drdy_fail = 0;
+static uint64_t diag_rdata_fail = 0;
+static uint64_t diag_postlevel_fail = 0;
 
 static void on_signal(int signo)
 {
@@ -369,23 +387,6 @@ static int gpio_set(
     );
 }
 
-static int gpio_get(const struct gpio_group *group)
-{
-    struct gpio_v2_line_values values = {
-        .bits = 0,
-        .mask = 1
-    };
-
-    if (ioctl(
-            group->fd,
-            GPIO_V2_LINE_GET_VALUES_IOCTL,
-            &values) < 0) {
-        return -1;
-    }
-
-    return (int)(values.bits & 1ULL);
-}
-
 static int select_cs(unsigned int cs)
 {
     return gpio_set(
@@ -446,12 +447,19 @@ static int ads_transaction(
     uint8_t *rx,
     size_t len)
 {
+    /* Guard CS1/CS2 switching as in the working Pi3 workaround. */
+    deselect_cs();
+    usleep(2);
+
     if (select_cs(cs) < 0)
         return -1;
 
+    usleep(1);
     int rc = spi_transfer(tx, rx, len);
+    usleep(1);
 
     deselect_cs();
+    usleep(2);
 
     return rc;
 }
@@ -635,93 +643,308 @@ static int ads_init(void)
     return 0;
 }
 
-static int wait_drdy_falling_edge(uint32_t timeout_us)
-{
-    uint64_t deadline = monotonic_us() + timeout_us;
-    int saw_high = 0;
-
-    while (running && monotonic_us() < deadline) {
-        int value = gpio_get(&drdy);
-
-        if (value < 0)
-            return -1;
-
-        if (value != 0) {
-            saw_high = 1;
-        } else if (saw_high) {
-            return 0;
-        }
-    }
-
-    return -1;
-}
-
-static int ads_select_channel(unsigned int channel)
+static int ads_reset_configure_channel(unsigned int channel)
 {
     uint8_t mux = channel == 0U
         ? ADS_MODE4_MUX_AIN0_AINCOM
         : ADS_MODE4_MUX_AIN1_AINCOM;
 
-    return ads_write_reg(
-        ADS_REG_MODE4,
-        mux | ADS_MODE4_GAIN_1
-    );
+    if (ads_command(ADS_CMD_RESET) < 0) {
+        fprintf(stderr, "ADS RESET failed\n");
+        return -1;
+    }
+
+    usleep(ADS_RESET_SETTLE_US);
+
+    if (ads_write_reg(ADS_REG_MODE3, ADS_MODE3_STATUS_OFF) < 0 ||
+        ads_write_reg(ADS_REG_MODE0, ADS_MODE0_40000SPS) < 0 ||
+        ads_write_reg(ADS_REG_MODE1, ADS_MODE1_CONTINUOUS_DELAY_50US) < 0) {
+        fprintf(stderr, "ADS CS1 configuration failed after RESET\n");
+        return -1;
+    }
+
+    if (ads_write_reg(ADS_REG_MODE4, mux | ADS_MODE4_GAIN_1) < 0) {
+        fprintf(stderr, "CH%u MODE4 write failed after RESET\n", channel + 1U);
+        return -1;
+    }
+
+    return 0;
 }
 
-static int retry_ads_select_channel(unsigned int channel)
+static int wait_drdy_status(uint32_t timeout_us)
 {
-    unsigned int retry_count = 0;
+    uint64_t deadline = monotonic_us() + timeout_us;
 
-    while (running) {
-        if (ads_select_channel(channel) == 0) {
-            if (retry_count > 0) {
-                fprintf(stderr,
-                        "CH%u MUX recovered after %u retries\n",
-                        channel + 1U,
-                        retry_count);
-            }
+    while (running && monotonic_us() < deadline) {
+        uint8_t status0 = 0;
 
+        if (ads_read_reg(ADS_REG_STATUS0, &status0) < 0)
+            return -1;
+
+        /* STATUS0.DRDY = 1 means conversion data are ready. */
+        if ((status0 & ADS_STATUS0_DRDY) != 0U)
             return 0;
-        }
-
-        retry_count++;
-
-        if (retry_count == 1U ||
-            retry_count % 1000U == 0U) {
-            fprintf(stderr,
-                    "CH%u MUX selection failed; retrying (%u)\n",
-                    channel + 1U,
-                    retry_count);
-        }
-
-        deselect_cs();
-        usleep(1000);
     }
 
     return -1;
 }
 
-static int ads_restart_and_read(int32_t *raw)
+/*
+ * Pi4 acquisition strategy:
+ *
+ * - The ADC channel is configured once for the whole 1-ms PWM cycle.
+ * - HIGH: START at rising edge, then collect 10 conversions in the same
+ *   500-us HIGH half-period.
+ * - LOW: START at falling edge, then collect 10 conversions in the same
+ *   500-us LOW half-period.
+ * - Only after the LOW block is complete do we RESET the ADC and configure
+ *   MODE4 for the next channel.  This avoids the observed CS2-after-RDATA
+ *   problem while preserving one VDIFF result per PWM cycle.
+ *
+ * Channels alternate every PWM period, so the design target is
+ * Target is 500 VDIFF results/s per channel; each 1-s report uses however many valid results were actually collected.
+ */
+
+struct robust_candidate {
+    int64_t value;
+    uint64_t distance2;
+};
+
+static int compare_i64(const void *a, const void *b)
 {
-    if (ads_command(ADS_CMD_START) < 0)
-        return -1;
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
 
-    if (wait_drdy_falling_edge(DRDY_TIMEOUT_US) < 0)
-        return -1;
+static int compare_robust_candidate(const void *a, const void *b)
+{
+    const struct robust_candidate *ca = a;
+    const struct robust_candidate *cb = b;
 
-    return ads_read_data(raw);
+    if (ca->distance2 < cb->distance2)
+        return -1;
+    if (ca->distance2 > cb->distance2)
+        return 1;
+    return (ca->value > cb->value) - (ca->value < cb->value);
+}
+
+static uint64_t abs_i64_to_u64(int64_t value)
+{
+    return value < 0 ? (uint64_t)(-value) : (uint64_t)value;
+}
+
+/*
+ * Robust mean:
+ * 1) find the median of all input values,
+ * 2) keep the values nearest to that median,
+ * 3) average only the kept values.
+ *
+ * For an even input count, median2 = 2 * median is represented exactly as
+ * sorted[N/2-1] + sorted[N/2].  Distances are therefore compared without
+ * floating-point arithmetic.
+ */
+static int64_t median_nearest_mean(
+    const int64_t *values,
+    size_t count,
+    size_t keep_count)
+{
+    int64_t sorted[OUTPUT_WINDOW_COUNT];
+    struct robust_candidate candidates[OUTPUT_WINDOW_COUNT];
+
+    if (count == 0U || keep_count == 0U ||
+        keep_count > count || count > OUTPUT_WINDOW_COUNT)
+        return 0;
+
+    memcpy(sorted, values, count * sizeof(sorted[0]));
+    qsort(sorted, count, sizeof(sorted[0]), compare_i64);
+
+    int64_t median2;
+    if ((count & 1U) != 0U) {
+        median2 = 2 * sorted[count / 2U];
+    } else {
+        median2 = sorted[count / 2U - 1U] + sorted[count / 2U];
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        candidates[i].value = values[i];
+        candidates[i].distance2 =
+            abs_i64_to_u64(2 * values[i] - median2);
+    }
+
+    qsort(candidates, count, sizeof(candidates[0]),
+          compare_robust_candidate);
+
+    int64_t sum = 0;
+    for (size_t i = 0; i < keep_count; ++i)
+        sum += candidates[i].value;
+
+    return sum / (int64_t)keep_count;
+}
+
+/*
+ * Second-stage report filter:
+ * sort all VDIFF values collected during the last report interval,
+ * discard the lowest 10 and highest 10, then average the remainder.
+ * If <=20 values were collected, use all available values rather than
+ * producing no result.
+ */
+static int64_t sigma3_mean_int64(
+    const int64_t *samples,
+    uint32_t count,
+    uint32_t *accepted_out)
+{
+    if (accepted_out != NULL)
+        *accepted_out = 0U;
+
+    if (count == 0U)
+        return 0;
+
+    long double sum = 0.0L;
+    for (uint32_t i = 0; i < count; ++i)
+        sum += (long double)samples[i];
+
+    long double mean = sum / (long double)count;
+
+    long double sq_sum = 0.0L;
+    for (uint32_t i = 0; i < count; ++i) {
+        long double d = (long double)samples[i] - mean;
+        sq_sum += d * d;
+    }
+
+    long double sigma = 0.0L;
+    if (count > 1U)
+        sigma = sqrtl(sq_sum / (long double)(count - 1U));
+
+    /*
+     * If sigma is zero, all samples are identical; use them all.
+     */
+    if (sigma == 0.0L) {
+        if (accepted_out != NULL)
+            *accepted_out = count;
+        return (int64_t)llroundl(mean);
+    }
+
+    long double limit = 3.0L * sigma;
+    long double filtered_sum = 0.0L;
+    uint32_t accepted = 0U;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        long double d = fabsl((long double)samples[i] - mean);
+        if (d <= limit) {
+            filtered_sum += (long double)samples[i];
+            accepted++;
+        }
+    }
+
+    /*
+     * Safety fallback: this should not normally happen, but do not divide by zero.
+     */
+    if (accepted == 0U) {
+        accepted = count;
+        filtered_sum = sum;
+    }
+
+    if (accepted_out != NULL)
+        *accepted_out = accepted;
+
+    return (int64_t)llroundl(filtered_sum / (long double)accepted);
+}
+
+static int32_t phase_robust_mean(const int32_t samples[PHASE_SAMPLE_COUNT])
+{
+    int64_t values[PHASE_SAMPLE_COUNT];
+
+    for (size_t i = 0; i < PHASE_SAMPLE_COUNT; ++i)
+        values[i] = samples[i];
+
+    return (int32_t)median_nearest_mean(
+        values,
+        PHASE_SAMPLE_COUNT,
+        PHASE_KEEP_COUNT
+    );
+}
+
+/*
+ * Start/restart continuous conversion immediately after the PWM edge.
+ * During EXTERNAL_SETTLING_US the ADC keeps converting.  After settling,
+ * read 10 results from the same excitation phase, paced at 25 us. STATUS0 is
+ * not polled inside the sample loop so the 10 reads fit within 500 us.
+ */
+static int ads_collect_phase_samples(
+    int expected_pwm_level,
+    int32_t *representative)
+{
+    uint64_t edge_us = 0;
+
+    if (wait_pwm_edge(expected_pwm_level ? 0 : 1,
+                      expected_pwm_level ? 1 : 0,
+                      &edge_us) < 0) {
+        diag_edge_fail++;
+        return -1;
+    }
+
+    sleep_until_us(edge_us + EXTERNAL_SETTLING_US);
+
+    if (pwm1_level() != expected_pwm_level) {
+        diag_prelevel_fail++;
+        return -1;
+    }
+
+    if (ads_command(ADS_CMD_START) < 0) {
+        diag_start_fail++;
+        return -1;
+    }
+
+    if (wait_drdy_status(DRDY_TIMEOUT_US) < 0) {
+        diag_drdy_fail++;
+        return -1;
+    }
+
+    if (ads_read_data(representative) < 0) {
+        diag_rdata_fail++;
+        return -1;
+    }
+
+    /*
+     * Do not reject based on PWM level after RDATA.
+     * The conversion was already started and completed in the intended phase.
+     * Linux/SPI readout may finish after the excitation edge without invalidating
+     * the conversion result that is already stored in the ADC data register.
+     */
+    return 0;
+}
+
+static int recover_and_configure_channel(unsigned int channel)
+{
+    for (unsigned int attempt = 1U; attempt <= 5U; ++attempt) {
+        if (ads_reset_configure_channel(channel) == 0)
+            return 0;
+
+        if (attempt == 1U || attempt == 5U) {
+            fprintf(stderr,
+                    "CH%u RESET/MUX recovery failed (%u/5)\n",
+                    channel + 1U, attempt);
+        }
+        usleep(100);
+    }
+
+    return -1;
 }
 
 static void accumulate_channel(
     struct channel_state *channel)
 {
+    if (channel->sample_count >= OUTPUT_WINDOW_COUNT)
+        return;
+
     int64_t high = channel->high_raw;
     int64_t low = channel->low_raw;
+    int64_t vdiff = (high - low) / 2;
 
     channel->high_sum += high;
     channel->low_sum += low;
-    channel->vcm_sum += (high + low) / 2;
-    channel->vdiff_sum += (high - low) / 2;
+    channel->vdiff_window[channel->sample_count] = vdiff;
     channel->sample_count++;
 }
 
@@ -730,8 +953,6 @@ static void reset_channel_average(
 {
     channel->high_sum = 0;
     channel->low_sum = 0;
-    channel->vcm_sum = 0;
-    channel->vdiff_sum = 0;
     channel->sample_count = 0;
 }
 
@@ -776,7 +997,8 @@ static int read_board_temp_mC(void)
     return (int)value;
 }
 
-/* Fifth-order calibration: measured angle T [mdeg] -> corrected C [mdeg]. */
+/* Fifth-order calibration is intentionally disabled for this test. */
+#if 0
 static double fit_angle_mdeg(double t)
 {
     return ((((-4.20529061e-17 * t
@@ -786,6 +1008,7 @@ static double fit_angle_mdeg(double t)
             + 0.916180507) * t
            - 0.568154573;
 }
+#endif
 
 static int open_udp(
     const char *address,
@@ -953,16 +1176,11 @@ int main(int argc, char **argv)
     double ch1_vdiff_lpf_uv = 0.0;
     double ch2_vdiff_lpf_uv = 0.0;
     double board_temp_lpf_mC = -1.0;
-    int lpf_initialized = 0;
     int temp_lpf_initialized = 0;
-
-    if (retry_ads_select_channel(selected_channel) < 0)
-        return EXIT_FAILURE;
 
     if (start_hardware_pwm(&pwm_epoch) < 0)
         return EXIT_FAILURE;
 
-    uint64_t last_rising_edge = 0;
     uint64_t last_report = pwm_epoch;
 
     fprintf(stderr,
@@ -970,272 +1188,219 @@ int main(int argc, char **argv)
             "ADC synchronized to GPIO18 edges\n");
 
     puts(
-        "time,Temp_raw_mC,Temp_LPF_mC,"
-        "CH1_HIGH_raw,CH1_LOW_raw,CH1_VDIFF_raw_uV,"
-        "CH1_VDIFF_mdeg,CH1_LPF_fitted_mdeg,CH1_LPF_fitted_mdeg_offset,"
-        "CH2_HIGH_raw,CH2_LOW_raw,CH2_VDIFF_raw_uV,"
-        "CH2_VDIFF_mdeg,CH2_LPF_fitted_mdeg,CH2_LPF_fitted_mdeg_offset"
+        "time_s,Temp_mC,"
+        "CH1_VDIFF_uV,CH1_RAW_mdeg,CH1_kept,CH1_total,"
+        "CH2_VDIFF_uV,CH2_RAW_mdeg,CH2_kept,CH2_total"
     );
 
     while (running) {
-    int valid_high = 0;
-    int valid_low = 0;
+        int valid_high = 0;
+        int valid_low = 0;
 
-    struct channel_state *channel =
-        &channels[selected_channel];
+        struct channel_state *channel =
+            &channels[selected_channel];
 
-    uint64_t rising_edge = 0;
-    uint64_t falling_edge = 0;
+        /* HIGH: one conversion in the HIGH phase. */
+        if (ads_collect_phase_samples(1, &channel->high_raw) == 0)
+            valid_high = 1;
 
-    if (wait_pwm_edge(0, 1, &rising_edge) < 0) {
-        missed_cycles++;
-        continue;
-    }
-
-    if (last_rising_edge != 0U) {
-        uint64_t elapsed = rising_edge - last_rising_edge;
-        uint64_t periods =
-            (elapsed + PWM_PERIOD_US / 2U) / PWM_PERIOD_US;
-
-        if (periods > 1U)
-            missed_cycles += periods - 1U;
-    }
-    last_rising_edge = rising_edge;
-
-    /*
-     * HIGH phase
-     */
-    /*
-     * MUX å ì‹¼ë”…ë»»å ìŽ„ì‘¬ä»¥ï¿½ å ìŽŒë®„è€Œìˆ‹ì˜™å ï¿½ ç­Œìš‘ì˜™å ìŽ„í€¡ç”±ê¹ì˜™å ï¿½ å ì™ì˜™ å ìŽˆëœ†ï¿½ì•²ì²‹å ì¸ì—å ï¿½
-     * HIGH phase å ìŽŒë®„è€Œìˆ‹ì˜™å ï¿½ å ìŽ„ì‘´ï¿½ï¿½ å ìŽŒë®‡ï¿½ë¤»ê²«å ì™ì˜™å ï¿½ å ì¬ë‰ï¿½ï¿½ ï¿½â‘£ì‘´æ²…ì‰ì˜™ï¿½ëº£ë¼„.
-     */
-    sleep_until_us(
-        rising_edge + EXTERNAL_SETTLING_US
-    );
-
-    if (pwm1_level() == 1 &&
-        ads_restart_and_read(&channel->high_raw) == 0 &&
-        pwm1_level() == 1) {
-        valid_high = 1;
-    }
-
-    if (!valid_high) {
-        missed_cycles++;
-        continue;
-    }
-
-    /*
-     * LOW phase
-     */
-
-    if (wait_pwm_edge(1, 0, &falling_edge) < 0) {
-        missed_cycles++;
-        continue;
-    }
-
-    sleep_until_us(
-        falling_edge + EXTERNAL_SETTLING_US
-    );
-
-    if (pwm1_level() == 0 &&
-        ads_restart_and_read(&channel->low_raw) == 0 &&
-        pwm1_level() == 0) {
-        valid_low = 1;
-    }
-
-    if (!valid_low)
-        missed_cycles++;
-
-    /* Select the next channel for the following PWM cycle. */
-    selected_channel ^= 1U;
-
-    if (retry_ads_select_channel(selected_channel) < 0)
-        break;
-
-    /*
-     * HIGHå ì™ì˜™ LOWæ¶ì‰ì˜™ ç­Œë¤´ë«€ï§ï¿½ å ìŽˆë²¡æ¹²ì™ì˜™å ï¿½ å ìŽˆìŠ¢å½›ï¿½
-     * 1ï¿½Î¿ì˜™ å ìŽ„í€£ï¿½ì¢‘ì˜™ï¿½ï¿½ë‡§ å ìŽ„ì‘´ï¿½ì‚¼ì˜™å ï¿½ å ì‹¼ë—«ë§™å ìŽŒë®†ï¿½ï¿½.
-     */
-    if (warmup_cycles > 0U) {
-        warmup_cycles--;
-    } else if (valid_high && valid_low) {
-        accumulate_channel(channel);
-    }
-
-    /*
-     * å ìŽ„ì‘¬ï¿½ë¯­ì˜™ç™’ï¿½ë®‰ ç­ŒìšŠë‚¯ï¿½ï¿½ å ìŽ„ì‘´çŒ¿ï¿½ ï¿½ê¾¨ë—€è«­ë°ì˜™å ï¿½
-     * 1ï¿½Î¿ì˜™ å ìŽˆë§¦ï¿½ï¿½ ï¿½â‘£ì‘´æ²…ï¿½ ç„ì‰ì˜™ UDP å ìŽ„ì‘´ï¿½ï¿½ ï¿½ë¸ì˜™ï¿½ë¸Œì‘´ï¿½ï¿½ åŸŸë°¸ì±¶å ì¸ì—å ï¿½ å ìŽˆë—€ï¿½ï¿½.
-     */
-
-        uint64_t now = monotonic_us();
-
-        if (now - last_report < REPORT_INTERVAL_US)
-            continue;
-
-        if (channels[0].sample_count == 0 ||
-            channels[1].sample_count == 0) {
-            last_report = now;
-            continue;
+        if (!valid_high) {
+            missed_cycles++;
+            if (recover_and_configure_channel(selected_channel) < 0)
+                break;
+            goto report_check;
         }
 
-        uint32_t ch1_count =
-            channels[0].sample_count;
+        /* LOW: one conversion in the LOW phase. */
+        if (ads_collect_phase_samples(0, &channel->low_raw) == 0)
+            valid_low = 1;
 
-        uint32_t ch2_count =
-            channels[1].sample_count;
+        if (!valid_low) {
+            missed_cycles++;
+            if (recover_and_configure_channel(selected_channel) < 0)
+                break;
+            goto report_check;
+        }
 
-        int64_t ch1_high_avg =
-            channels[0].high_sum / ch1_count;
+        if (warmup_cycles > 0U) {
+            warmup_cycles--;
+        } else {
+            accumulate_channel(channel);
+        }
 
-        int64_t ch1_low_avg =
-            channels[0].low_sum / ch1_count;
+        /*
+         * RDATA has already occurred on CS1. Recover CS2 with RESET, then
+         * configure the next channel before its next rising edge.
+         */
+        {
+            unsigned int next_channel = selected_channel ^ 1U;
+            if (recover_and_configure_channel(next_channel) < 0)
+                break;
+            selected_channel = next_channel;
+        }
 
-        int64_t ch1_vdiff_avg =
-            channels[0].vdiff_sum / ch1_count;
+report_check:
+        {
+            uint64_t now = monotonic_us();
+            if (now - last_report < REPORT_INTERVAL_US)
+                continue;
 
-        int64_t ch2_high_avg =
-            channels[1].high_sum / ch2_count;
+            uint32_t ch1_count = channels[0].sample_count;
+            uint32_t ch2_count = channels[1].sample_count;
 
-        int64_t ch2_low_avg =
-            channels[1].low_sum / ch2_count;
+            fprintf(stderr,
+                    "[1s] CH1=%u CH2=%u missed=%llu "
+                    "fail(e/p/s/d/r)=%llu/%llu/%llu/%llu/%llu\n",
+                    ch1_count,
+                    ch2_count,
+                    (unsigned long long)missed_cycles,
+                    (unsigned long long)diag_edge_fail,
+                    (unsigned long long)diag_prelevel_fail,
+                    (unsigned long long)diag_start_fail,
+                    (unsigned long long)diag_drdy_fail,
+                    (unsigned long long)diag_rdata_fail);
 
-        int64_t ch2_vdiff_avg =
-            channels[1].vdiff_sum / ch2_count;
+            /* Need at least one valid VDIFF from both channels for a CSV row. */
+            if (ch1_count == 0U || ch2_count == 0U) {
+                reset_channel_average(&channels[0]);
+                reset_channel_average(&channels[1]);
+                missed_cycles = 0;
+                diag_edge_fail = 0;
+                diag_prelevel_fail = 0;
+                diag_start_fail = 0;
+                diag_drdy_fail = 0;
+                diag_rdata_fail = 0;
+                diag_postlevel_fail = 0;
+                last_report = now;
+                continue;
+            }
 
-        int32_t ch1_vdiff_uv =
-            code_to_uv(ch1_vdiff_avg);
+            /*
+             * Second robust stage: compute mean and sample sigma over the
+             * 1-second VDIFF window, reject samples outside mean +/- 3 sigma,
+             * then average the retained samples.
+             */
+            uint32_t ch1_sigma_accepted = 0U;
+            uint32_t ch2_sigma_accepted = 0U;
 
-        int32_t ch2_vdiff_uv =
-            code_to_uv(ch2_vdiff_avg);
+            int64_t ch1_vdiff_final = sigma3_mean_int64(
+                channels[0].vdiff_window,
+                ch1_count,
+                &ch1_sigma_accepted
+            );
 
-        double ch1_angle_mdeg =
-            ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
+            int64_t ch2_vdiff_final = sigma3_mean_int64(
+                channels[1].vdiff_window,
+                ch2_count,
+                &ch2_sigma_accepted
+            );
 
-        double ch2_angle_mdeg =
-            ch2_vdiff_uv / SENSOR_UV_PER_MDEG;
+            int32_t ch1_vdiff_uv = code_to_uv(ch1_vdiff_final);
+            int32_t ch2_vdiff_uv = code_to_uv(ch2_vdiff_final);
 
-        double dt =
-            (double)(now - last_report) / 1000000.0;
+            /* raw mdeg after single HIGH/LOW sampling and 1-s 3-sigma filtering. */
+            double ch1_angle_mdeg =
+                ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
+            double ch2_angle_mdeg =
+                ch2_vdiff_uv / SENSOR_UV_PER_MDEG;
 
-        if (!lpf_initialized) {
+            double dt =
+                (double)(now - last_report) / 1000000.0;
+
+            /* LPF disabled (tau = 0): output follows robust raw value. */
             ch1_vdiff_lpf_uv = (double)ch1_vdiff_uv;
             ch2_vdiff_lpf_uv = (double)ch2_vdiff_uv;
-            lpf_initialized = 1;
-        } else {
-            double alpha = dt / (LPF_TAU_SECONDS + dt);
 
-            ch1_vdiff_lpf_uv +=
-                alpha * ((double)ch1_vdiff_uv - ch1_vdiff_lpf_uv);
-            ch2_vdiff_lpf_uv +=
-                alpha * ((double)ch2_vdiff_uv - ch2_vdiff_lpf_uv);
-        }
+            double ch1_lpf_input_mdeg = ch1_angle_mdeg;
+            double ch2_lpf_input_mdeg = ch2_angle_mdeg;
 
-        double ch1_lpf_input_mdeg =
-            ch1_vdiff_lpf_uv / SENSOR_UV_PER_MDEG;
+            /* Fifth-order calibration temporarily disabled. */
+            double ch1_lpf_mdeg = ch1_lpf_input_mdeg;
+            double ch2_lpf_mdeg = ch2_lpf_input_mdeg;
 
-        double ch2_lpf_input_mdeg =
-            ch2_vdiff_lpf_uv / SENSOR_UV_PER_MDEG;
+            double ch1_lpf_mdeg_offset =
+                ch1_lpf_mdeg + offset_ch1;
+            double ch2_lpf_mdeg_offset =
+                ch2_lpf_mdeg + offset_ch2;
 
-        double ch1_lpf_mdeg =
-            fit_angle_mdeg(ch1_lpf_input_mdeg);
+            double elapsed_time_s =
+                (double)(now - pwm_epoch) / 1000000.0;
 
-        double ch2_lpf_mdeg =
-            fit_angle_mdeg(ch2_lpf_input_mdeg);
+            int board_temp_mC = read_board_temp_mC();
 
-        double ch1_lpf_mdeg_offset =
-            ch1_lpf_mdeg + offset_ch1;
-
-        double ch2_lpf_mdeg_offset =
-            ch2_lpf_mdeg + offset_ch2;
-
-        double elapsed_time_s =
-            (double)(now - pwm_epoch) / 1000000.0;
-
-        int board_temp_mC = read_board_temp_mC();
-
-        if (board_temp_mC >= 0) {
-            if (!temp_lpf_initialized) {
-                board_temp_lpf_mC = (double)board_temp_mC;
-                temp_lpf_initialized = 1;
-            } else {
-                double alpha = dt / (LPF_TAU_SECONDS + dt);
-
-                board_temp_lpf_mC +=
-                    alpha *
-                    ((double)board_temp_mC - board_temp_lpf_mC);
+            if (board_temp_mC >= 0) {
+                if (!temp_lpf_initialized) {
+                    board_temp_lpf_mC = (double)board_temp_mC;
+                    temp_lpf_initialized = 1;
+                } else if (LPF_TAU_SECONDS <= 0.0) {
+                    board_temp_lpf_mC = (double)board_temp_mC;
+                } else {
+                    double alpha = dt / (LPF_TAU_SECONDS + dt);
+                    board_temp_lpf_mC +=
+                        alpha *
+                        ((double)board_temp_mC - board_temp_lpf_mC);
+                }
             }
-        }
 
-        char console_message[448];
+            char console_message[256];
 
-        int console_length = snprintf(
-            console_message,
-            sizeof(console_message),
-            "%.3f,%d,%.1f,"
-            "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
-            "%lld,%lld,%ld,%.3f,%.3f,%.3f\n",
-
-            elapsed_time_s,
-            board_temp_mC,
-            temp_lpf_initialized ? board_temp_lpf_mC : -1.0,
-
-            (long long)ch1_high_avg,
-            (long long)ch1_low_avg,
-            (long)ch1_vdiff_uv,
-            ch1_angle_mdeg,
-            ch1_lpf_mdeg,
-            ch1_lpf_mdeg_offset,
-
-            (long long)ch2_high_avg,
-            (long long)ch2_low_avg,
-            (long)ch2_vdiff_uv,
-            ch2_angle_mdeg,
-            ch2_lpf_mdeg,
-            ch2_lpf_mdeg_offset
-        );
-
-        (void)console_length;
-
-        fputs(console_message, stdout);
-        fflush(stdout);
-
-        char compact_message[128];
-
-        int compact_length = snprintf(
-            compact_message,
-            sizeof(compact_message),
-            "%.1f,%.3f,%.1f,%.3f\n",
-            ch1_vdiff_lpf_uv,
-            ch1_lpf_mdeg_offset,
-            ch2_vdiff_lpf_uv,
-            ch2_lpf_mdeg_offset
-        );
-
-        if (udp_fd >= 0 && compact_length > 0) {
-            (void)sendto(
-                udp_fd,
-                compact_message,
-                (size_t)compact_length,
-                0,
-                (struct sockaddr *)&udp_destination,
-                sizeof(udp_destination)
+            int console_length = snprintf(
+                console_message,
+                sizeof(console_message),
+                "%.3f,%d,"
+                "%ld,%.3f,%u,%u,"
+                "%ld,%.3f,%u,%u\n",
+                elapsed_time_s,
+                board_temp_mC,
+                (long)ch1_vdiff_uv,
+                ch1_angle_mdeg,
+                ch1_sigma_accepted,
+                ch1_count,
+                (long)ch2_vdiff_uv,
+                ch2_angle_mdeg,
+                ch2_sigma_accepted,
+                ch2_count
             );
+
+            (void)console_length;
+            fputs(console_message, stdout);
+            fflush(stdout);
+
+            char compact_message[128];
+
+            int compact_length = snprintf(
+                compact_message,
+                sizeof(compact_message),
+                "%.1f,%.3f,%.1f,%.3f\n",
+                ch1_vdiff_lpf_uv,
+                ch1_lpf_mdeg_offset,
+                ch2_vdiff_lpf_uv,
+                ch2_lpf_mdeg_offset
+            );
+
+            if (udp_fd >= 0 && compact_length > 0) {
+                (void)sendto(
+                    udp_fd,
+                    compact_message,
+                    (size_t)compact_length,
+                    0,
+                    (struct sockaddr *)&udp_destination,
+                    sizeof(udp_destination)
+                );
+            }
+
+            fprintf(stderr,
+                    "[3sigma] CH1=%u/%u CH2=%u/%u\n",
+                    ch1_sigma_accepted,
+                    ch1_count,
+                    ch2_sigma_accepted,
+                    ch2_count);
+
+            missed_cycles = 0;
+            reset_channel_average(&channels[0]);
+            reset_channel_average(&channels[1]);
+            last_report = now;
         }
-
-        fprintf(
-            stderr,
-            "averaged samples: CH1=%u, CH2=%u, skipped ADC cycles=%llu\n",
-            ch1_count,
-            ch2_count,
-            (unsigned long long)missed_cycles
-        );
-
-        missed_cycles = 0;
-
-        reset_channel_average(&channels[0]);
-        reset_channel_average(&channels[1]);
-
-        last_report = now;
     }
 
     if (udp_fd >= 0)
