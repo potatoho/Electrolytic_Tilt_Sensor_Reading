@@ -37,6 +37,7 @@
 #define ROBUST_MAX_PAIRS       512U
 #define ROBUST_MAD_K           6.0
 #define ROBUST_MIN_THRESHOLD   8.0
+#define CHANNEL_BATCH_PAIRS     100U
 
 #define TCP_MAX_CLIENTS        8
 #define TCP_RX_BUFFER_SIZE    128
@@ -1007,20 +1008,6 @@ static double fit_angle_mdeg(double t)
            - 0.568154573;
 }
 
-/* Fifth-order TCP compensation: input voltage [mV] -> compensated result. */
-static double tcp_compensation_from_mv(double mv)
-{
-    /* Horner form: 0.1234*mv^5 + 0.5678*mv^4 + 0.01234*mv^3
-     *            + 0.5667*mv^2 + 0.3212*mv + 0.0021
-     */
-    return ((((0.1234 * mv
-              + 0.5678) * mv
-             + 0.01234) * mv
-            + 0.5667) * mv
-           + 0.3212) * mv
-          + 0.0021;
-}
-
 static int open_tcp_server(uint16_t port)
 {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -1387,6 +1374,7 @@ int main(int argc, char **argv)
     struct channel_state channels[2] = {0};
 
     unsigned int selected_channel = 0;
+    unsigned int channel_batch_count = 0;
     uint64_t pwm_epoch = 0;
     uint64_t missed_cycles = 0;
     unsigned int warmup_cycles = 20U;
@@ -1399,16 +1387,26 @@ int main(int argc, char **argv)
     if (start_hardware_pwm(&pwm_epoch) < 0)
         return EXIT_FAILURE;
 
+    /*
+     * Configure CH1 once at startup.  The same ADC channel is then sampled
+     * for CHANNEL_BATCH_PAIRS valid HIGH/LOW pairs before switching.
+     */
+    if (ads_reset_configure_channel(selected_channel) < 0) {
+        fprintf(stderr, "Initial CH1 configuration failed\n");
+        return EXIT_FAILURE;
+    }
+
     uint64_t last_rising_edge = 0;
     uint64_t last_report = pwm_epoch;
 
     fprintf(stderr,
             "GPIO18/GPIO19 hardware PWM: 1 kHz complementary, "
             "PWM_RANGE=%u PWM_DUTY=%u (%.6f%%), "
-            "ADC synchronized to GPIO18 edges | RESET once per CH pair | STATUS0.DRDY\n",
+            "ADC synchronized to GPIO18 edges | CH batch=%u pairs | RESET only on channel switch | STATUS0.DRDY\n",
             PWM_RANGE,
             PWM_DUTY,
-            100.0 * (double)PWM_DUTY / (double)PWM_RANGE);
+            100.0 * (double)PWM_DUTY / (double)PWM_RANGE,
+            CHANNEL_BATCH_PAIRS);
 
     puts(
         "time,Temp_raw_mC,Temp_LPF_mC,"
@@ -1428,19 +1426,10 @@ int main(int argc, char **argv)
         &channels[selected_channel];
 
     /*
-     * CS2 is known to become unavailable after RDATA.
-     * Restore the ADS serial state and configure MODE4 once here, before
-     * collecting both HIGH and LOW samples for this channel.
+     * The channel is configured only at startup and at a 100-pair batch
+     * boundary.  No MODE4/CS2 access is needed between pairs on the same
+     * channel, avoiding the observed CS2 lock-up after RDATA.
      */
-    if (ads_reset_configure_channel(selected_channel) < 0) {
-        missed_cycles++;
-        dbg_reset_cfg_fail++;
-        if ((dbg_reset_cfg_fail % 10ULL) == 1ULL)
-            fprintf(stderr, "[DBG] reset/config fail CH%u count=%llu\n",
-                    selected_channel + 1U,
-                    (unsigned long long)dbg_reset_cfg_fail);
-        continue;
-    }
 
     uint64_t rising_edge = 0;
     uint64_t falling_edge = 0;
@@ -1546,13 +1535,6 @@ int main(int argc, char **argv)
     }
 
     /*
-     * Select the next channel logically only.
-     * Do NOT access MODE4/CS2 here because RDATA has already occurred.
-     * The next loop begins with RESET + full channel configuration.
-     */
-    selected_channel ^= 1U;
-
-    /*
      * HIGHÃƒÂ¥ ÃƒÂ¬Ã¢â€žÂ¢ÃƒÂ¬Ã‹Å“Ã¢â€žÂ¢ LOWÃƒÂ¦Ã‚Â¶ÃƒÂ¬Ã¢â‚¬Â°ÃƒÂ¬Ã‹Å“Ã¢â€žÂ¢ ÃƒÂ§Ã‚Â­Ã…â€™ÃƒÂ«Ã‚Â¤Ã‚Â´ÃƒÂ«Ã‚Â«Ã¢â€šÂ¬ÃƒÂ¯Ã‚Â§ÃƒÂ¯Ã‚Â¿Ã‚Â½ ÃƒÂ¥ ÃƒÂ¬Ã…Â½Ã‹â€ ÃƒÂ«Ã‚Â²Ã‚Â¡ÃƒÂ¦Ã‚Â¹Ã‚Â²ÃƒÂ¬Ã¢â€žÂ¢ÃƒÂ¬Ã‹Å“Ã¢â€žÂ¢ÃƒÂ¥ ÃƒÂ¯Ã‚Â¿Ã‚Â½ ÃƒÂ¥ ÃƒÂ¬Ã…Â½Ã‹â€ ÃƒÂ¬Ã…Â Ã‚Â¢ÃƒÂ¥Ã‚Â½Ã¢â‚¬ÂºÃƒÂ¯Ã‚Â¿Ã‚Â½
      * 1ÃƒÂ¯Ã‚Â¿Ã‚Â½ÃƒÅ½Ã‚Â¿ÃƒÂ¬Ã‹Å“Ã¢â€žÂ¢ ÃƒÂ¥ ÃƒÂ¬Ã…Â½Ã¢â‚¬Å¾ÃƒÂ­Ã¢â€šÂ¬Ã‚Â£ÃƒÂ¯Ã‚Â¿Ã‚Â½ÃƒÂ¬Ã‚Â¢Ã¢â‚¬ËœÃƒÂ¬Ã‹Å“Ã¢â€žÂ¢ÃƒÂ¯Ã‚Â¿Ã‚Â½ÃƒÂ¯Ã‚Â¿Ã‚Â½ÃƒÂ«Ã¢â‚¬Â¡Ã‚Â§ ÃƒÂ¥ ÃƒÂ¬Ã…Â½Ã¢â‚¬Å¾ÃƒÂ¬Ã¢â‚¬ËœÃ‚Â´ÃƒÂ¯Ã‚Â¿Ã‚Â½ÃƒÂ¬Ã¢â‚¬Å¡Ã‚Â¼ÃƒÂ¬Ã‹Å“Ã¢â€žÂ¢ÃƒÂ¥ ÃƒÂ¯Ã‚Â¿Ã‚Â½ ÃƒÂ¥ ÃƒÂ¬Ã¢â‚¬Â¹Ã‚Â¼ÃƒÂ«Ã¢â‚¬â€Ã‚Â«ÃƒÂ«Ã‚Â§Ã¢â€žÂ¢ÃƒÂ¥ ÃƒÂ¬Ã…Â½Ã…â€™ÃƒÂ«Ã‚Â®Ã¢â‚¬Â ÃƒÂ¯Ã‚Â¿Ã‚Â½ÃƒÂ¯Ã‚Â¿Ã‚Â½.
      */
@@ -1560,6 +1542,39 @@ int main(int argc, char **argv)
         warmup_cycles--;
     } else if (valid_high && valid_low) {
         accumulate_channel(channel);
+        channel_batch_count++;
+
+        /*
+         * CH1 x100 -> CH2 x100 -> CH1 x100 -> ... continuously.
+         * Only valid HIGH/LOW pairs count toward the 100-pair batch.
+         */
+        if (channel_batch_count >= CHANNEL_BATCH_PAIRS) {
+            selected_channel ^= 1U;
+            channel_batch_count = 0U;
+
+            if (ads_reset_configure_channel(selected_channel) < 0) {
+                missed_cycles++;
+                dbg_reset_cfg_fail++;
+
+                if ((dbg_reset_cfg_fail % 10ULL) == 1ULL) {
+                    fprintf(stderr,
+                            "[DBG] batch switch/config fail CH%u count=%llu\n",
+                            selected_channel + 1U,
+                            (unsigned long long)dbg_reset_cfg_fail);
+                }
+
+                /*
+                 * Retry configuration on the next loop before attempting
+                 * to sample this channel.
+                 */
+                while (running &&
+                       ads_reset_configure_channel(selected_channel) < 0) {
+                    missed_cycles++;
+                    dbg_reset_cfg_fail++;
+                    usleep(1000);
+                }
+            }
+        }
     }
 
     /*
@@ -1728,21 +1743,18 @@ int main(int argc, char **argv)
 
         if (tcp_server_fd >= 0) {
             /*
-             * TCP #deg? returns the fifth-order compensated result calculated
-             * directly from the current 1-second VDIFF voltage in mV.
-             * #vol? still returns the uncompensated VDIFF voltage [mV].
+             * TCP returns the current 1-second RAW measurement result.
+             * No LPF, polynomial fitting, or zero-offset correction is applied.
+             *
+             * #deg? : raw VDIFF converted only by SENSOR_UV_PER_MDEG
+             * #vol? : raw VDIFF voltage converted from uV to mV in
+             *         handle_tcp_command()
              */
-            double ch1_tcp_comp =
-                tcp_compensation_from_mv((double)ch1_vdiff_uv / 1000.0);
-
-            double ch2_tcp_comp =
-                tcp_compensation_from_mv((double)ch2_vdiff_uv / 1000.0);
-
             service_tcp_clients(
                 tcp_server_fd,
                 tcp_clients,
-                ch1_tcp_comp,
-                ch2_tcp_comp,
+                ch1_angle_mdeg,
+                ch2_angle_mdeg,
                 (double)ch1_vdiff_uv,
                 (double)ch2_vdiff_uv
             );
