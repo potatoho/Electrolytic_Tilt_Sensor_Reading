@@ -1007,6 +1007,20 @@ static double fit_angle_mdeg(double t)
            - 0.568154573;
 }
 
+/* Fifth-order TCP compensation: input voltage [mV] -> compensated result. */
+static double tcp_compensation_from_mv(double mv)
+{
+    /* Horner form: 0.1234*mv^5 + 0.5678*mv^4 + 0.01234*mv^3
+     *            + 0.5667*mv^2 + 0.3212*mv + 0.0021
+     */
+    return ((((0.1234 * mv
+              + 0.5678) * mv
+             + 0.01234) * mv
+            + 0.5667) * mv
+           + 0.3212) * mv
+          + 0.0021;
+}
+
 static int open_tcp_server(uint16_t port)
 {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -1714,18 +1728,21 @@ int main(int argc, char **argv)
 
         if (tcp_server_fd >= 0) {
             /*
-             * TCP returns the current 1-second RAW measurement result.
-             * No LPF, polynomial fitting, or zero-offset correction is applied.
-             *
-             * #deg? : raw VDIFF converted only by SENSOR_UV_PER_MDEG
-             * #vol? : raw VDIFF voltage converted from uV to mV in
-             *         handle_tcp_command()
+             * TCP #deg? returns the fifth-order compensated result calculated
+             * directly from the current 1-second VDIFF voltage in mV.
+             * #vol? still returns the uncompensated VDIFF voltage [mV].
              */
+            double ch1_tcp_comp =
+                tcp_compensation_from_mv((double)ch1_vdiff_uv / 1000.0);
+
+            double ch2_tcp_comp =
+                tcp_compensation_from_mv((double)ch2_vdiff_uv / 1000.0);
+
             service_tcp_clients(
                 tcp_server_fd,
                 tcp_clients,
-                ch1_angle_mdeg,
-                ch2_angle_mdeg,
+                ch1_tcp_comp,
+                ch2_tcp_comp,
                 (double)ch1_vdiff_uv,
                 (double)ch2_vdiff_uv
             );
