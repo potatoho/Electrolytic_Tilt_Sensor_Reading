@@ -1,0 +1,1338 @@
+/*
+ * Electrolytic tilt sensor reader – Rev 2 HAT firmware
+ *
+ * Hardware assumptions (Rev 2 schematic, 2026-10-30):
+ *   - GPIO18/GPIO19 : 1 kHz complementary hardware PWM -> AHCT125 -> sensor R1/R2
+ *   - XOR edge detector (1G86) -> H5 jumper 1-2 -> ADS125H02 START
+ *       => ADC START rises at EVERY PWM edge (both HIGH and LOW phase)
+ *   - ADS125H02 MODE1.DELAY provides the settling wait (default here 189 us)
+ *   - GPIO24 : ADS125H02 DRDY# (dedicated pin 13), falling edge = data ready
+ *   - GPIO22/23 : CS1# / CS2#
+ *   - RESET# : 10 k pull-up on board (no GPIO) -> RESET command only at init
+ *   - EXC_EN watchdog (1G123, 100 ms) is pure hardware; firmware does nothing
+ *
+ * Timing budget per half period (500 us, 40 kSPS, sinc5):
+ *   edge +0        START (XOR pulse ~10 us)
+ *   edge +189      DELAY ends, conversion window starts
+ *   edge +~318     DRDY# falls (189 + ~129 us conversion incl. overhead)
+ *   edge +~318..   firmware reads RDATA (must finish before next edge at +500)
+ *
+ * Differences from Rev 1 firmware:
+ *   - No software START command, no sleep_until_us() settling, no busy-wait on PWM edges
+ *   - Pulse (one-shot) conversion mode, DELAY = 189 us
+ *   - DRDY via GPIO line events (kernel-queued, so "already low" cannot be missed)
+ *   - Channel switch = MODE4 write via CS2 only; RESET+reconfigure kept as fallback
+ *   - Reference selectable: AVDD (ratiometric, default) or REF5040 via REFP0
+ *   - Optional PGA gain
+ */
+
+#define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/gpio.h>
+#include <linux/spi/spidev.h>
+#include <math.h>
+#include <poll.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/* Build-time configuration                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Reference selection (ADS125H02 REF register, address 06h)
+ *   0 : AVDD/AGND  -> ratiometric with the 5 V excitation rail (chip default)
+ *   1 : REFP0/REFN0 -> REF5040 4.096 V absolute reference
+ * Note: with VREF > AVDD-1 V the usable full scale is +/-(AVDD-1 V)/Gain,
+ * i.e. about +/-4.0 V at gain 1. Irrelevant for the mV-level sensor signal.
+ */
+#ifndef USE_REF5040
+#define USE_REF5040 0
+#endif
+
+/*
+ * PGA gain code (MODE4 GAIN[3:0]): 0x04 = 1, 0x05 = 2, 0x06 = 4 ...
+ * Sensor: 400 uV/mdeg, +/-3 deg linear -> +/-1.2 V VDIFF peak.
+ * Gain 2 still fits (+/-2.5 V/2 = +/-1.25 V FS ratiometric). Gain 4 does not.
+ */
+#ifndef ADS_GAIN_CODE
+#define ADS_GAIN_CODE   0x04U
+#define ADS_GAIN_NUM    1LL
+#define ADS_GAIN_DEN    1LL
+#endif
+
+/*
+ * MODE1.DELAY[3:0] – settling delay inserted by the ADC after the START edge.
+ *   0x05 = 119 us, 0x06 = 189 us (default here), 0x07 = 328 us (too long for 500 us half period)
+ */
+#ifndef ADS_DELAY_CODE
+#define ADS_DELAY_CODE  0x06U
+#endif
+
+/* ------------------------------------------------------------------ */
+
+#define GPIO_CHIP          "/dev/gpiochip0"
+#define GPIO_ADC_CS1       22U
+#define GPIO_ADC_CS2       23U
+#define GPIO_ADC_DRDY      24U
+
+#define SPI_DEVICE         "/dev/spidev0.0"
+#define SPI_SPEED_HZ       8000000U
+
+#define PWM_PERIOD_US         1000ULL
+#define HALF_PERIOD_US         500ULL
+#define DRDY_WAIT_TIMEOUT_MS      3
+#define DRDY_MAX_AGE_US          150ULL  /* level read later than this may belong to next phase */
+#define PAIR_MIN_GAP_US          400ULL  /* LOW DRDY must follow HIGH DRDY by ~500 us */
+#define PAIR_MAX_GAP_US          600ULL
+#define REPORT_INTERVAL_US    100000ULL
+#define LPF_TAU_SECONDS       5.0
+#define ROBUST_MAX_PAIRS       512U
+#define ROBUST_MAD_K           6.0
+#define ROBUST_MIN_THRESHOLD   8.0
+#define CHANNEL_BATCH_PAIRS     50U
+#define MUX_SETTLE_PAIRS         1U   /* pairs discarded right after a MUX change */
+#define MUX_WRITE_RETRIES        3U
+#define WARMUP_PAIRS            20U
+
+#define TCP_MAX_CLIENTS        8
+#define TCP_RX_BUFFER_SIZE    128
+
+/* Raspberry Pi 4 / BCM2711 peripheral addresses. */
+#define GPIO_BASE_PHYS     0xFE200000UL
+#define PWM_BASE_PHYS      0xFE20C000UL
+#define CLK_BASE_PHYS      0xFE101000UL
+#define PERIPHERAL_SIZE    4096UL
+
+#define GPFSEL1            1U
+#define GPLEV0             (0x34U / 4U)
+#define PWM_CTL            0U
+#define PWM_STA            1U
+#define PWM_RNG1           4U
+#define PWM_DAT1           5U
+#define PWM_RNG2           8U
+#define PWM_DAT2           9U
+#define CM_PWMCTL          (0xA0U / 4U)
+#define CM_PWMDIV          (0xA4U / 4U)
+
+#define CM_PASSWORD        0x5A000000U
+#define CM_CTL_SRC_OSC     0x00000001U
+#define CM_CTL_ENAB        0x00000010U
+#define CM_CTL_KILL        0x00000020U
+#define CM_CTL_BUSY        0x00000080U
+
+#define PWM_CTL_PWEN1      (1U << 0)
+#define PWM_CTL_MSEN1      (1U << 7)
+#define PWM_CTL_PWEN2      (1U << 8)
+#define PWM_CTL_POLA2      (1U << 12)
+#define PWM_CTL_MSEN2      (1U << 15)
+
+/* 54 MHz oscillator / 2 / 27000 = 1 kHz; one PWM count ~= 37.0 ns. */
+#define PWM_CLOCK_DIVIDER   2U
+#define PWM_RANGE          27000U
+#define PWM_DUTY           13499U
+/*
+ * Fine DC-balance trim (less critical on Rev 2 because AINCOM = EXC_MID,
+ * but still keep the average DC on the electrodes near zero):
+ *   13500 = exact 50.0000 %
+ *   13501 = HIGH longer by 1 count (~37 ns)
+ *   13499 = HIGH shorter by 1 count (~37 ns)
+ */
+
+/* ADS125H02 commands / registers */
+#define ADS_CMD_RESET      0x06U
+#define ADS_CMD_RDATA      0x12U
+#define ADS_CMD_RREG       0x20U
+#define ADS_CMD_WREG       0x40U
+
+#define ADS_REG_ID         0x00U
+#define ADS_REG_STATUS0    0x01U
+#define ADS_REG_MODE0      0x02U
+#define ADS_REG_MODE1      0x03U
+#define ADS_REG_MODE3      0x05U
+#define ADS_REG_REF        0x06U
+#define ADS_REG_MODE4      0x10U   /* CS2 */
+
+#define ADS_MODE0_40000SPS          0x80U   /* DR=10000b, 40 kSPS (sinc5 forced) */
+#define ADS_MODE1_PULSE             0x10U   /* CONVRT=1: one-shot per START edge */
+#define ADS_MODE1_VALUE             (ADS_MODE1_PULSE | (ADS_DELAY_CODE & 0x0FU))
+#define ADS_MODE3_STATUS_OFF        0x00U
+#define ADS_MODE4_MUX_AIN1_AINCOM   0x20U
+#define ADS_MODE4_MUX_AIN0_AINCOM   0x30U
+
+#define ADS_REF_AVDD_AGND           0x05U   /* RMUXP=01 AVDD, RMUXN=01 AGND */
+#define ADS_REF_REFP0_REFN0         0x0AU   /* RMUXP=10, RMUXN=10 */
+
+#if USE_REF5040
+#define ADS_REF_VALUE   ADS_REF_REFP0_REFN0
+#define ADS_VREF_UV     4096000LL
+#else
+#define ADS_REF_VALUE   ADS_REF_AVDD_AGND
+#define ADS_VREF_UV     5000000LL
+#endif
+
+#define ADS_CODE_FS        8388608LL
+
+/* 1 degree = 400 mV = 400 uV/mdeg */
+#define SENSOR_UV_PER_MDEG 400.0
+
+/* Final angle offset correction [mdeg]. */
+static double offset_ch1 = 0.0;
+static double offset_ch2 = 0.0;
+
+struct gpio_group {
+    int fd;
+    unsigned int count;
+};
+
+struct channel_state {
+    int64_t high_sum;
+    int64_t low_sum;
+    int64_t vdiff_sum;
+    uint32_t sample_count;
+
+    int32_t high_buf[ROBUST_MAX_PAIRS];
+    int32_t low_buf[ROBUST_MAX_PAIRS];
+    uint32_t pair_count;
+
+    uint32_t spike_edge_count;
+    uint32_t spike_reject_count;
+    uint32_t spike_fallback_count;
+};
+
+static volatile sig_atomic_t running = 1;
+
+static int spi_fd = -1;
+static struct gpio_group chip_select = {-1, 0};
+static struct gpio_group drdy = {-1, 0};
+static volatile uint32_t *gpio_regs;
+static volatile uint32_t *pwm_regs;
+static volatile uint32_t *clk_regs;
+static uint32_t saved_gpfsel1;
+static int pwm_gpio_configured;
+
+/* diagnostics */
+static uint64_t dbg_drdy_timeout = 0;
+static uint64_t dbg_stale_level = 0;
+static uint64_t dbg_rdata_fail = 0;
+static uint64_t dbg_unpaired = 0;
+static uint64_t dbg_mux_retry = 0;
+static uint64_t dbg_mux_reset_fallback = 0;
+static uint64_t dbg_pairs_ok = 0;
+
+static void on_signal(int signo)
+{
+    (void)signo;
+    running = 0;
+}
+
+static uint64_t monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static void peripheral_barrier(void)
+{
+    __sync_synchronize();
+}
+
+static int pwm1_level(void)
+{
+    return (gpio_regs[GPLEV0] & (1U << 18)) != 0U;
+}
+
+/* ------------------------------------------------------------------ */
+/* Hardware PWM (unchanged from Rev 1)                                 */
+/* ------------------------------------------------------------------ */
+
+static void *map_peripheral(int mem_fd, off_t address)
+{
+    void *mapped = mmap(NULL, PERIPHERAL_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, mem_fd, address);
+    if (mapped == MAP_FAILED) {
+        perror("mmap");
+        return NULL;
+    }
+    return mapped;
+}
+
+static int wait_pwm_clock(int expected_busy)
+{
+    for (unsigned int i = 0; i < 1000000U; ++i) {
+        int busy = (clk_regs[CM_PWMCTL] & CM_CTL_BUSY) != 0;
+        if (busy == expected_busy)
+            return 0;
+    }
+    return -1;
+}
+
+static int start_hardware_pwm(uint64_t *epoch_us)
+{
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (mem_fd < 0) {
+        perror("/dev/mem (run as root)");
+        return -1;
+    }
+
+    gpio_regs = map_peripheral(mem_fd, GPIO_BASE_PHYS);
+    pwm_regs = map_peripheral(mem_fd, PWM_BASE_PHYS);
+    clk_regs = map_peripheral(mem_fd, CLK_BASE_PHYS);
+    close(mem_fd);
+
+    if (gpio_regs == NULL || pwm_regs == NULL || clk_regs == NULL)
+        return -1;
+
+    saved_gpfsel1 = gpio_regs[GPFSEL1];
+    uint32_t fsel = saved_gpfsel1;
+    fsel &= ~((7U << 24) | (7U << 27));
+    fsel |= (2U << 24) | (2U << 27); /* GPIO18/19 ALT5 */
+    gpio_regs[GPFSEL1] = fsel;
+    peripheral_barrier();
+    pwm_gpio_configured = 1;
+
+    pwm_regs[PWM_CTL] = 0;
+    clk_regs[CM_PWMCTL] = CM_PASSWORD | CM_CTL_KILL;
+    peripheral_barrier();
+
+    if (wait_pwm_clock(0) < 0) {
+        fprintf(stderr, "PWM clock did not stop\n");
+        return -1;
+    }
+
+    clk_regs[CM_PWMDIV] = CM_PASSWORD | (PWM_CLOCK_DIVIDER << 12);
+    clk_regs[CM_PWMCTL] = CM_PASSWORD | CM_CTL_SRC_OSC | CM_CTL_ENAB;
+    peripheral_barrier();
+
+    if (wait_pwm_clock(1) < 0) {
+        fprintf(stderr, "PWM clock did not start\n");
+        return -1;
+    }
+
+    pwm_regs[PWM_STA] = 0x01FCU;
+    pwm_regs[PWM_RNG1] = PWM_RANGE;
+    usleep(10);
+    pwm_regs[PWM_DAT1] = PWM_DUTY;
+    pwm_regs[PWM_RNG2] = PWM_RANGE;
+    usleep(10);
+    pwm_regs[PWM_DAT2] = PWM_DUTY;
+    peripheral_barrier();
+
+    /* One write starts both channels; channel 2 is polarity-inverted. */
+    pwm_regs[PWM_CTL] = PWM_CTL_PWEN1 | PWM_CTL_MSEN1 |
+                        PWM_CTL_PWEN2 | PWM_CTL_POLA2 | PWM_CTL_MSEN2;
+    peripheral_barrier();
+
+    *epoch_us = monotonic_us();
+    return 0;
+}
+
+static void stop_hardware_pwm(void)
+{
+    if (pwm_regs != NULL) {
+        pwm_regs[PWM_CTL] = 0;
+        peripheral_barrier();
+    }
+    if (gpio_regs != NULL && pwm_gpio_configured) {
+        gpio_regs[GPFSEL1] = saved_gpfsel1;
+        peripheral_barrier();
+    }
+    if (gpio_regs != NULL)
+        munmap((void *)gpio_regs, PERIPHERAL_SIZE);
+    if (pwm_regs != NULL)
+        munmap((void *)pwm_regs, PERIPHERAL_SIZE);
+    if (clk_regs != NULL)
+        munmap((void *)clk_regs, PERIPHERAL_SIZE);
+
+    gpio_regs = NULL;
+    pwm_regs = NULL;
+    clk_regs = NULL;
+    pwm_gpio_configured = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* GPIO (character device v2)                                          */
+/* ------------------------------------------------------------------ */
+
+static int gpio_request(int chip_fd, const unsigned int *offsets,
+                        unsigned int count, uint64_t flags,
+                        uint64_t initial_bits, const char *consumer,
+                        struct gpio_group *group)
+{
+    struct gpio_v2_line_request req;
+    memset(&req, 0, sizeof(req));
+
+    for (unsigned int i = 0; i < count; ++i)
+        req.offsets[i] = offsets[i];
+
+    req.num_lines = count;
+    req.config.flags = flags;
+    snprintf(req.consumer, sizeof(req.consumer), "%s", consumer);
+
+    if (flags & GPIO_V2_LINE_FLAG_OUTPUT) {
+        req.config.num_attrs = 1;
+        req.config.attrs[0].attr.id = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
+        req.config.attrs[0].attr.values = initial_bits;
+        req.config.attrs[0].mask = (1ULL << count) - 1ULL;
+    }
+
+    if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
+        perror("GPIO_V2_GET_LINE_IOCTL");
+        return -1;
+    }
+
+    group->fd = req.fd;
+    group->count = count;
+    return 0;
+}
+
+static int gpio_set(const struct gpio_group *group, uint64_t bits)
+{
+    struct gpio_v2_line_values values = {
+        .bits = bits,
+        .mask = (1ULL << group->count) - 1ULL
+    };
+    return ioctl(group->fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &values);
+}
+
+static int select_cs(unsigned int cs)
+{
+    return gpio_set(&chip_select, cs == 1U ? 0x2ULL : 0x1ULL);
+}
+
+static void deselect_cs(void)
+{
+    (void)gpio_set(&chip_select, 0x3ULL);
+}
+
+/* Drop any queued DRDY events (used at start and after a MUX change). */
+static void drdy_drain(void)
+{
+    struct gpio_v2_line_event ev;
+    int flags = fcntl(drdy.fd, F_GETFL);
+    fcntl(drdy.fd, F_SETFL, flags | O_NONBLOCK);
+    while (read(drdy.fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
+        ;
+    fcntl(drdy.fd, F_SETFL, flags);
+}
+
+/*
+ * Wait for the next DRDY# falling edge. Returns 0 and the kernel timestamp
+ * (CLOCK_MONOTONIC, us) of the edge, -1 on timeout/error.
+ * Because events are queued in the kernel, an edge that happened before we
+ * started waiting is not lost (the Rev 1 "DRDY already low" problem).
+ */
+static int drdy_wait(uint64_t *edge_us)
+{
+    struct pollfd pfd = { .fd = drdy.fd, .events = POLLIN };
+    int rc = poll(&pfd, 1, DRDY_WAIT_TIMEOUT_MS);
+
+    if (rc <= 0)
+        return -1;
+
+    struct gpio_v2_line_event ev;
+    ssize_t n = read(drdy.fd, &ev, sizeof(ev));
+    if (n != (ssize_t)sizeof(ev))
+        return -1;
+
+    *edge_us = ev.timestamp_ns / 1000ULL;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* ADS125H02 SPI                                                       */
+/* ------------------------------------------------------------------ */
+
+static uint8_t ads_crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0xFFU;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (unsigned int bit = 0; bit < 8; ++bit)
+            crc = (crc & 0x80U) ? (uint8_t)((crc << 1) ^ 0x07U)
+                                : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+static int spi_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
+{
+    struct spi_ioc_transfer tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.tx_buf = (uintptr_t)tx;
+    tr.rx_buf = (uintptr_t)rx;
+    tr.len = (uint32_t)len;
+    tr.speed_hz = SPI_SPEED_HZ;
+    tr.bits_per_word = 8;
+    return ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr) < 0 ? -1 : 0;
+}
+
+static int ads_transaction(unsigned int cs, const uint8_t *tx,
+                           uint8_t *rx, size_t len)
+{
+    if (select_cs(cs) < 0)
+        return -1;
+    int rc = spi_transfer(tx, rx, len);
+    deselect_cs();
+    return rc;
+}
+
+static int ads_command(uint8_t command)
+{
+    uint8_t tx[4] = {command, 0, 0, 0};
+    uint8_t rx[4] = {0};
+    tx[2] = ads_crc8(tx, 2);
+    if (ads_transaction(1, tx, rx, sizeof(tx)) < 0)
+        return -1;
+    return rx[3] == tx[2] ? 0 : -1;
+}
+
+static int ads_read_reg(uint8_t address, uint8_t *value)
+{
+    uint8_t tx[6] = {0};
+    uint8_t rx[6] = {0};
+    tx[0] = ADS_CMD_RREG | (address & 0x1FU);
+    tx[2] = ads_crc8(tx, 2);
+    unsigned int cs = address >= 0x10U ? 2U : 1U;
+
+    if (ads_transaction(cs, tx, rx, sizeof(tx)) < 0)
+        return -1;
+    if (rx[3] != tx[2])
+        return -1;
+    if (rx[5] != ads_crc8(&rx[4], 1))
+        return -1;
+    *value = rx[4];
+    return 0;
+}
+
+static int ads_write_reg(uint8_t address, uint8_t value)
+{
+    uint8_t tx[4] = { ADS_CMD_WREG | (address & 0x1FU), value, 0, 0 };
+    uint8_t rx[4] = {0};
+    tx[2] = ads_crc8(tx, 2);
+    unsigned int cs = address >= 0x10U ? 2U : 1U;
+
+    if (ads_transaction(cs, tx, rx, sizeof(tx)) < 0)
+        return -1;
+    return rx[3] == tx[2] ? 0 : -1;
+}
+
+static int ads_write_verify(uint8_t address, uint8_t value, const char *name)
+{
+    uint8_t rb = 0;
+    if (ads_write_reg(address, value) < 0) {
+        fprintf(stderr, "ADS %s write failed\n", name);
+        return -1;
+    }
+    if (ads_read_reg(address, &rb) < 0 || rb != value) {
+        fprintf(stderr, "ADS %s verify failed (expected=0x%02X actual=0x%02X)\n",
+                name, value, rb);
+        return -1;
+    }
+    return 0;
+}
+
+static int ads_read_data(int32_t *code)
+{
+    uint8_t tx[8] = { ADS_CMD_RDATA, 0, 0, 0, 0, 0, 0, 0 };
+    uint8_t rx[8] = {0};
+    tx[2] = ads_crc8(tx, 2);
+
+    if (ads_transaction(1, tx, rx, sizeof(tx)) < 0)
+        return -1;
+    if (rx[3] != tx[2])
+        return -1;
+    if (rx[7] != ads_crc8(&rx[4], 3))
+        return -1;
+
+    uint32_t raw = ((uint32_t)rx[4] << 16) | ((uint32_t)rx[5] << 8) | rx[6];
+    if (raw & 0x800000UL)
+        raw |= 0xFF000000UL;
+    *code = (int32_t)raw;
+    return 0;
+}
+
+static uint8_t mux_for_channel(unsigned int channel)
+{
+    return channel == 0U ? ADS_MODE4_MUX_AIN0_AINCOM : ADS_MODE4_MUX_AIN1_AINCOM;
+}
+
+/*
+ * Full configuration. Used at start-up and as a recovery path.
+ * Writes are verified by read-back.
+ */
+static int ads_configure(unsigned int channel)
+{
+    if (ads_write_verify(ADS_REG_MODE3, ADS_MODE3_STATUS_OFF, "MODE3") < 0) return -1;
+    if (ads_write_verify(ADS_REG_MODE0, ADS_MODE0_40000SPS, "MODE0") < 0)  return -1;
+    if (ads_write_verify(ADS_REG_MODE1, ADS_MODE1_VALUE, "MODE1") < 0)     return -1;
+    if (ads_write_verify(ADS_REG_REF,   ADS_REF_VALUE, "REF") < 0)         return -1;
+    if (ads_write_verify(ADS_REG_MODE4,
+                         mux_for_channel(channel) | ADS_GAIN_CODE, "MODE4") < 0)
+        return -1;
+    return 0;
+}
+
+static int ads_init(unsigned int channel)
+{
+    uint8_t id = 0;
+
+    deselect_cs();
+    usleep(1000);
+
+    /* RESET# has only a pull-up on Rev 2 -> use the command. */
+    if (ads_command(ADS_CMD_RESET) < 0) {
+        fprintf(stderr, "ADS reset failed\n");
+        return -1;
+    }
+    usleep(10000);
+
+    if (ads_read_reg(ADS_REG_ID, &id) < 0 || (id & 0xF0U) != 0x60U) {
+        fprintf(stderr, "ADS ID read failed (ID=0x%02X)\n", id);
+        return -1;
+    }
+    printf("ADS ID=0x%02X\n", id);
+
+    if (ads_configure(channel) < 0)
+        return -1;
+
+    printf("ADS MODE0=0x%02X MODE1=0x%02X (pulse, DELAY code %u) REF=0x%02X GAIN code 0x%X\n",
+           ADS_MODE0_40000SPS, ADS_MODE1_VALUE, ADS_DELAY_CODE,
+           ADS_REF_VALUE, ADS_GAIN_CODE);
+    return 0;
+}
+
+/*
+ * Channel switch: MODE4 write via CS2 only (RESET# is properly pulled up on
+ * Rev 2, so the Rev 1 RESET-before-every-switch workaround is gone).
+ * If the write keeps failing, fall back to RESET + full reconfigure once.
+ */
+static int ads_select_channel(unsigned int channel)
+{
+    uint8_t value = mux_for_channel(channel) | ADS_GAIN_CODE;
+
+    for (unsigned int attempt = 0; attempt < MUX_WRITE_RETRIES; ++attempt) {
+        if (ads_write_verify(ADS_REG_MODE4, value, "MODE4") == 0) {
+            if (attempt > 0)
+                dbg_mux_retry += attempt;
+            return 0;
+        }
+        deselect_cs();
+        usleep(100);
+    }
+
+    dbg_mux_reset_fallback++;
+    fprintf(stderr, "MODE4 write failed %u times; RESET + reconfigure (fallback #%llu)\n",
+            MUX_WRITE_RETRIES, (unsigned long long)dbg_mux_reset_fallback);
+
+    deselect_cs();
+    if (ads_command(ADS_CMD_RESET) < 0)
+        return -1;
+    usleep(1000);
+    return ads_configure(channel);
+}
+
+/* ------------------------------------------------------------------ */
+/* Robust statistics (unchanged)                                       */
+/* ------------------------------------------------------------------ */
+
+static int compare_i32(const void *a, const void *b)
+{
+    int32_t va = *(const int32_t *)a;
+    int32_t vb = *(const int32_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static double median_i32(const int32_t *src, uint32_t n)
+{
+    if (n == 0U)
+        return 0.0;
+    int32_t tmp[ROBUST_MAX_PAIRS];
+    if (n > ROBUST_MAX_PAIRS)
+        n = ROBUST_MAX_PAIRS;
+    memcpy(tmp, src, n * sizeof(tmp[0]));
+    qsort(tmp, n, sizeof(tmp[0]), compare_i32);
+    if (n & 1U)
+        return (double)tmp[n / 2U];
+    return 0.5 * ((double)tmp[n / 2U - 1U] + (double)tmp[n / 2U]);
+}
+
+static double mad_i32(const int32_t *src, uint32_t n, double median)
+{
+    if (n == 0U)
+        return 0.0;
+    int32_t dev[ROBUST_MAX_PAIRS];
+    if (n > ROBUST_MAX_PAIRS)
+        n = ROBUST_MAX_PAIRS;
+    for (uint32_t i = 0; i < n; ++i) {
+        double d = fabs((double)src[i] - median);
+        if (d > 2147483647.0)
+            d = 2147483647.0;
+        dev[i] = (int32_t)llround(d);
+    }
+    return median_i32(dev, n);
+}
+
+static void accumulate_pair(struct channel_state *channel,
+                            int32_t high_raw, int32_t low_raw)
+{
+    channel->high_sum += high_raw;
+    channel->low_sum += low_raw;
+    channel->vdiff_sum += ((int64_t)high_raw - low_raw) / 2;
+    channel->sample_count++;
+
+    if (channel->pair_count < ROBUST_MAX_PAIRS) {
+        channel->high_buf[channel->pair_count] = high_raw;
+        channel->low_buf[channel->pair_count] = low_raw;
+        channel->pair_count++;
+    }
+}
+
+static void reset_channel_average(struct channel_state *channel)
+{
+    channel->high_sum = 0;
+    channel->low_sum = 0;
+    channel->vdiff_sum = 0;
+    channel->sample_count = 0;
+    channel->pair_count = 0;
+}
+
+static void robust_pair_mean(struct channel_state *channel,
+                             int64_t *high_mean, int64_t *low_mean,
+                             int64_t *vdiff_mean, uint32_t *accepted_count)
+{
+    uint32_t n = channel->pair_count;
+
+    if (n == 0U) {
+        *high_mean = *low_mean = *vdiff_mean = 0;
+        *accepted_count = 0U;
+        return;
+    }
+
+    double med_h = median_i32(channel->high_buf, n);
+    double med_l = median_i32(channel->low_buf, n);
+    double thr_h = fmax(ROBUST_MIN_THRESHOLD,
+                        ROBUST_MAD_K * 1.4826 * mad_i32(channel->high_buf, n, med_h));
+    double thr_l = fmax(ROBUST_MIN_THRESHOLD,
+                        ROBUST_MAD_K * 1.4826 * mad_i32(channel->low_buf, n, med_l));
+
+    int64_t sum_h = 0, sum_l = 0;
+    uint32_t good = 0U, edge_spikes = 0U, rejected = 0U;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        int bad_h = fabs((double)channel->high_buf[i] - med_h) > thr_h;
+        int bad_l = fabs((double)channel->low_buf[i] - med_l) > thr_l;
+        edge_spikes += (uint32_t)bad_h + (uint32_t)bad_l;
+        if (bad_h || bad_l) {
+            rejected++;
+            continue;
+        }
+        sum_h += channel->high_buf[i];
+        sum_l += channel->low_buf[i];
+        good++;
+    }
+
+    channel->spike_edge_count = edge_spikes;
+    channel->spike_reject_count = rejected;
+    channel->spike_fallback_count = 0U;
+
+    if (good == 0U) {
+        channel->spike_fallback_count = 1U;
+        *high_mean = channel->high_sum / (int64_t)channel->sample_count;
+        *low_mean = channel->low_sum / (int64_t)channel->sample_count;
+        *vdiff_mean = channel->vdiff_sum / (int64_t)channel->sample_count;
+        *accepted_count = channel->sample_count;
+        return;
+    }
+
+    *high_mean = sum_h / (int64_t)good;
+    *low_mean = sum_l / (int64_t)good;
+    *vdiff_mean = (*high_mean - *low_mean) / 2;
+    *accepted_count = good;
+}
+
+static int32_t code_to_uv(int64_t code)
+{
+    int64_t uv = code * ADS_VREF_UV * ADS_GAIN_DEN;
+    uv /= ADS_CODE_FS * ADS_GAIN_NUM;
+    return (int32_t)uv;
+}
+
+static int read_board_temp_mC(void)
+{
+    int fd = open("/sys/class/thermal/thermal_zone0/temp", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    char buffer[32];
+    ssize_t length = read(fd, buffer, sizeof(buffer) - 1U);
+    close(fd);
+    if (length <= 0)
+        return -1;
+    buffer[length] = '\0';
+    char *end = NULL;
+    long value = strtol(buffer, &end, 10);
+    return end == buffer ? -1 : (int)value;
+}
+
+/* Fifth-order calibration: measured angle T [mdeg] -> corrected C [mdeg]. */
+static double fit_angle_mdeg(double t)
+{
+    return ((((-4.20529061e-17 * t
+               - 7.57486695e-13) * t
+              + 9.26577767e-9) * t
+             - 1.15097020e-5) * t
+            + 0.916180507) * t
+           - 0.568154573;
+}
+
+/* ------------------------------------------------------------------ */
+/* TCP command server (unchanged)                                      */
+/* ------------------------------------------------------------------ */
+
+struct tcp_client {
+    int fd;
+    char rx[TCP_RX_BUFFER_SIZE];
+    size_t used;
+};
+
+static int open_tcp_server(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+    int enable = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) {
+        perror("setsockopt(SO_REUSEADDR)");
+        close(fd);
+        return -1;
+    }
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(port);
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, TCP_MAX_CLIENTS) < 0) {
+        perror("listen");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void close_tcp_client(struct tcp_client *client)
+{
+    if (client->fd >= 0)
+        close(client->fd);
+    client->fd = -1;
+    client->used = 0;
+}
+
+static void send_all_nonblocking(int fd, const char *buffer, size_t length)
+{
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t n = send(fd, buffer + sent, length - sent, MSG_NOSIGNAL);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+}
+
+static void handle_tcp_command(int fd, const char *command,
+                               double ch1_mdeg, double ch2_mdeg,
+                               double ch1_uv, double ch2_uv)
+{
+    char response[160];
+    int length;
+
+    if (strcmp(command, "#deg?") == 0) {
+        length = snprintf(response, sizeof(response),
+                          "CH1=%.3f mdeg,CH2=%.3f mdeg\r\n", ch1_mdeg, ch2_mdeg);
+    } else if (strcmp(command, "#vol?") == 0) {
+        length = snprintf(response, sizeof(response),
+                          "CH1=%.6f mV,CH2=%.6f mV\r\n",
+                          ch1_uv / 1000.0, ch2_uv / 1000.0);
+    } else if (strcmp(command, "quit") == 0 || strcmp(command, "exit") == 0) {
+        length = snprintf(response, sizeof(response), "BYE\r\n");
+    } else if (command[0] == '\0') {
+        return;
+    } else {
+        length = snprintf(response, sizeof(response), "ERR\r\n");
+    }
+
+    if (length > 0)
+        send_all_nonblocking(fd, response, (size_t)length);
+}
+
+static void service_tcp_clients(int server_fd,
+                                struct tcp_client clients[TCP_MAX_CLIENTS],
+                                double ch1_mdeg, double ch2_mdeg,
+                                double ch1_uv, double ch2_uv)
+{
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t peer_length = sizeof(peer);
+        int client_fd = accept4(server_fd, (struct sockaddr *)&peer,
+                                &peer_length, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (client_fd < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                perror("accept4");
+            break;
+        }
+
+        int slot = -1;
+        for (int i = 0; i < TCP_MAX_CLIENTS; ++i) {
+            if (clients[i].fd < 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            static const char busy[] = "BUSY\r\n";
+            send_all_nonblocking(client_fd, busy, sizeof(busy) - 1U);
+            close(client_fd);
+            continue;
+        }
+
+        clients[slot].fd = client_fd;
+        clients[slot].used = 0;
+        static const char welcome[] = "CONNECTED: use #deg? or #vol?\r\n";
+        send_all_nonblocking(client_fd, welcome, sizeof(welcome) - 1U);
+    }
+
+    for (int i = 0; i < TCP_MAX_CLIENTS; ++i) {
+        struct tcp_client *client = &clients[i];
+        if (client->fd < 0)
+            continue;
+
+        for (;;) {
+            char temp[64];
+            ssize_t n = recv(client->fd, temp, sizeof(temp), 0);
+            if (n == 0) {
+                close_tcp_client(client);
+                break;
+            }
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break;
+                close_tcp_client(client);
+                break;
+            }
+
+            for (ssize_t j = 0; j < n; ++j) {
+                unsigned char c = (unsigned char)temp[j];
+                if (c == 0xFFU)
+                    continue; /* Telnet negotiation */
+
+                if (c == '\r' || c == '\n') {
+                    if (client->used > 0U) {
+                        client->rx[client->used] = '\0';
+                        handle_tcp_command(client->fd, client->rx,
+                                           ch1_mdeg, ch2_mdeg, ch1_uv, ch2_uv);
+                        if (strcmp(client->rx, "quit") == 0 ||
+                            strcmp(client->rx, "exit") == 0) {
+                            close_tcp_client(client);
+                            break;
+                        }
+                        client->used = 0;
+                    }
+                    continue;
+                }
+
+                if (client->used + 1U < sizeof(client->rx)) {
+                    client->rx[client->used++] = (char)c;
+                } else {
+                    client->used = 0;
+                    static const char error[] = "ERR command too long\r\n";
+                    send_all_nonblocking(client->fd, error, sizeof(error) - 1U);
+                }
+            }
+            if (client->fd < 0)
+                break;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+
+static void cleanup(void)
+{
+    stop_hardware_pwm();
+    if (chip_select.fd >= 0) {
+        deselect_cs();
+        close(chip_select.fd);
+    }
+    if (drdy.fd >= 0)
+        close(drdy.fd);
+    if (spi_fd >= 0)
+        close(spi_fd);
+}
+
+static void try_realtime(void)
+{
+    struct sched_param sp = { .sched_priority = 50 };
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) < 0)
+        fprintf(stderr, "SCHED_FIFO not available (%s); continuing\n", strerror(errno));
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0)
+        fprintf(stderr, "mlockall failed (%s); continuing\n", strerror(errno));
+}
+
+int main(int argc, char **argv)
+{
+    uint16_t tcp_port = argc > 1 ? (uint16_t)strtoul(argv[1], NULL, 10) : 5005;
+    int chip_fd = -1;
+    int tcp_server_fd = -1;
+    struct tcp_client tcp_clients[TCP_MAX_CLIENTS];
+
+    for (int i = 0; i < TCP_MAX_CLIENTS; ++i) {
+        tcp_clients[i].fd = -1;
+        tcp_clients[i].used = 0;
+    }
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    atexit(cleanup);
+    try_realtime();
+
+    chip_fd = open(GPIO_CHIP, O_RDONLY | O_CLOEXEC);
+    if (chip_fd < 0) {
+        perror(GPIO_CHIP);
+        return EXIT_FAILURE;
+    }
+
+    const unsigned int cs_offsets[] = { GPIO_ADC_CS1, GPIO_ADC_CS2 };
+    const unsigned int drdy_offsets[] = { GPIO_ADC_DRDY };
+
+    if (gpio_request(chip_fd, cs_offsets, 2, GPIO_V2_LINE_FLAG_OUTPUT,
+                     0x3, "ads-cs", &chip_select) < 0 ||
+        gpio_request(chip_fd, drdy_offsets, 1,
+                     GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_EDGE_FALLING,
+                     0, "ads-drdy", &drdy) < 0) {
+        close(chip_fd);
+        return EXIT_FAILURE;
+    }
+    close(chip_fd);
+
+    spi_fd = open(SPI_DEVICE, O_RDWR | O_CLOEXEC);
+    if (spi_fd < 0) {
+        perror(SPI_DEVICE);
+        return EXIT_FAILURE;
+    }
+
+    uint32_t mode = SPI_MODE_1 | SPI_NO_CS;
+    uint8_t bits = 8;
+    uint32_t speed = SPI_SPEED_HZ;
+    if (ioctl(spi_fd, SPI_IOC_WR_MODE32, &mode) < 0 ||
+        ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
+        ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+        perror("SPI configuration");
+        return EXIT_FAILURE;
+    }
+
+    unsigned int selected_channel = 0;
+
+    /*
+     * Configure the ADC BEFORE the PWM starts: once PWM runs, the XOR
+     * generates START edges and the ADC begins converting on its own.
+     */
+    if (ads_init(selected_channel) < 0)
+        return EXIT_FAILURE;
+
+    tcp_server_fd = open_tcp_server(tcp_port);
+    if (tcp_server_fd < 0) {
+        fprintf(stderr, "TCP server startup failed on port %u\n", tcp_port);
+        return EXIT_FAILURE;
+    }
+    fprintf(stderr, "TCP command server listening on port %u (up to %u clients)\n",
+            tcp_port, TCP_MAX_CLIENTS);
+
+    struct channel_state channels[2] = {0};
+    unsigned int channel_batch_count = 0U;
+    unsigned int settle_pairs_left = MUX_SETTLE_PAIRS;
+    unsigned int warmup_pairs = WARMUP_PAIRS;
+    int report_ready = 0;
+    uint64_t pwm_epoch = 0;
+    uint64_t missed_cycles = 0;
+    double ch1_vdiff_lpf_uv = 0.0, ch2_vdiff_lpf_uv = 0.0;
+    double board_temp_lpf_mC = -1.0;
+    int lpf_initialized = 0, temp_lpf_initialized = 0;
+
+    if (start_hardware_pwm(&pwm_epoch) < 0)
+        return EXIT_FAILURE;
+
+    drdy_drain();
+
+    uint64_t last_report = pwm_epoch;
+
+    /* HIGH-phase sample waiting for its LOW partner */
+    int have_high = 0;
+    int32_t pending_high_raw = 0;
+    uint64_t pending_high_us = 0;
+    uint64_t last_pair_us = 0;
+
+    fprintf(stderr,
+            "GPIO18/GPIO19 hardware PWM 1 kHz complementary, RANGE=%u DUTY=%u (%.6f%%) | "
+            "ADC: HW START via XOR, pulse mode, DELAY code 0x%X, REF=%s, GAIN code 0x%X | "
+            "CH batch=%u pairs | output ~0.1 s\n",
+            PWM_RANGE, PWM_DUTY, 100.0 * (double)PWM_DUTY / (double)PWM_RANGE,
+            ADS_DELAY_CODE, USE_REF5040 ? "REF5040" : "AVDD(ratiometric)",
+            ADS_GAIN_CODE, CHANNEL_BATCH_PAIRS);
+
+    puts("time,Temp_raw_mC,Temp_LPF_mC,"
+         "CH1_HIGH_raw,CH1_LOW_raw,CH1_VDIFF_raw_uV,"
+         "CH1_VDIFF_mdeg,CH1_LPF_fitted_mdeg,CH1_LPF_fitted_mdeg_offset,"
+         "CH2_HIGH_raw,CH2_LOW_raw,CH2_VDIFF_raw_uV,"
+         "CH2_VDIFF_mdeg,CH2_LPF_fitted_mdeg,CH2_LPF_fitted_mdeg_offset,"
+         "CH1_spike_edge,CH1_spike_reject,CH1_spike_fallback,CH1_accepted,"
+         "CH2_spike_edge,CH2_spike_reject,CH2_spike_fallback,CH2_accepted");
+
+    while (running) {
+        struct channel_state *channel = &channels[selected_channel];
+        uint64_t drdy_us = 0;
+
+        /* -------- 1. wait for a conversion result (one per PWM edge) ---- */
+        if (drdy_wait(&drdy_us) < 0) {
+            dbg_drdy_timeout++;
+            have_high = 0;
+            if ((dbg_drdy_timeout % 100ULL) == 1ULL)
+                fprintf(stderr, "[DBG] DRDY timeout count=%llu (PWM/START/jumper H5 1-2?)\n",
+                        (unsigned long long)dbg_drdy_timeout);
+            continue;
+        }
+
+        /* -------- 2. tag the phase by the PWM level ------------------- */
+        /*
+         * DRDY falls ~318 us after the edge; the next edge is ~180 us later.
+         * If we got here too late the level may already belong to the next
+         * phase, so the sample is discarded instead of mis-tagged.
+         */
+        int level = pwm1_level();
+        uint64_t age = monotonic_us() - drdy_us;
+        if (age > DRDY_MAX_AGE_US) {
+            dbg_stale_level++;
+            have_high = 0;
+            missed_cycles++;
+            continue;
+        }
+
+        /* -------- 3. read the result -------------------------------- */
+        int32_t raw = 0;
+        if (ads_read_data(&raw) < 0) {
+            dbg_rdata_fail++;
+            have_high = 0;
+            missed_cycles++;
+            if ((dbg_rdata_fail % 100ULL) == 1ULL)
+                fprintf(stderr, "[DBG] RDATA/CRC fail count=%llu\n",
+                        (unsigned long long)dbg_rdata_fail);
+            continue;
+        }
+
+        /* -------- 4. pair HIGH then LOW ----------------------------- */
+        if (level == 1) {
+            pending_high_raw = raw;
+            pending_high_us = drdy_us;
+            have_high = 1;
+            continue;
+        }
+
+        if (!have_high) {
+            dbg_unpaired++;
+            continue;
+        }
+        have_high = 0;
+
+        uint64_t gap = drdy_us - pending_high_us;
+        if (gap < PAIR_MIN_GAP_US || gap > PAIR_MAX_GAP_US) {
+            dbg_unpaired++;
+            missed_cycles++;
+            continue;
+        }
+
+        if (last_pair_us != 0U) {
+            uint64_t periods = (drdy_us - last_pair_us + PWM_PERIOD_US / 2U) / PWM_PERIOD_US;
+            if (periods > 1U)
+                missed_cycles += periods - 1U;
+        }
+        last_pair_us = drdy_us;
+        dbg_pairs_ok++;
+
+        if (warmup_pairs > 0U) {
+            warmup_pairs--;
+            continue;
+        }
+        if (settle_pairs_left > 0U) {
+            settle_pairs_left--;
+            continue;
+        }
+
+        accumulate_pair(channel, pending_high_raw, raw);
+        channel_batch_count++;
+
+        /* -------- 5. channel batch complete -> switch MUX ------------ */
+        if (channel_batch_count >= CHANNEL_BATCH_PAIRS) {
+            unsigned int completed_channel = selected_channel;
+            selected_channel ^= 1U;
+            channel_batch_count = 0U;
+            settle_pairs_left = MUX_SETTLE_PAIRS;
+
+            if (ads_select_channel(selected_channel) < 0) {
+                fprintf(stderr, "channel switch to CH%u failed\n", selected_channel + 1U);
+                missed_cycles++;
+                continue;
+            }
+            drdy_drain();   /* a conversion may have completed during the write */
+
+            if (completed_channel == 1U)
+                report_ready = 1;
+        }
+
+        /* -------- 6. report ----------------------------------------- */
+        uint64_t now = monotonic_us();
+        if (!report_ready)
+            continue;
+        if (now - last_report < REPORT_INTERVAL_US)
+            continue;
+
+        if (channels[0].sample_count == 0 || channels[1].sample_count == 0) {
+            fprintf(stderr,
+                    "[frame-no-data] CH1=%u CH2=%u missed=%llu drdy_to=%llu stale=%llu "
+                    "rdata=%llu unpaired=%llu pairs_ok=%llu\n",
+                    channels[0].sample_count, channels[1].sample_count,
+                    (unsigned long long)missed_cycles,
+                    (unsigned long long)dbg_drdy_timeout,
+                    (unsigned long long)dbg_stale_level,
+                    (unsigned long long)dbg_rdata_fail,
+                    (unsigned long long)dbg_unpaired,
+                    (unsigned long long)dbg_pairs_ok);
+            last_report = now;
+            report_ready = 0;
+            continue;
+        }
+
+        uint32_t ch1_count = channels[0].sample_count;
+        uint32_t ch2_count = channels[1].sample_count;
+        int64_t ch1_high_avg, ch1_low_avg, ch1_vdiff_avg;
+        int64_t ch2_high_avg, ch2_low_avg, ch2_vdiff_avg;
+        uint32_t ch1_accepted = 0U, ch2_accepted = 0U;
+
+        robust_pair_mean(&channels[0], &ch1_high_avg, &ch1_low_avg,
+                         &ch1_vdiff_avg, &ch1_accepted);
+        robust_pair_mean(&channels[1], &ch2_high_avg, &ch2_low_avg,
+                         &ch2_vdiff_avg, &ch2_accepted);
+
+        int32_t ch1_vdiff_uv = code_to_uv(ch1_vdiff_avg);
+        int32_t ch2_vdiff_uv = code_to_uv(ch2_vdiff_avg);
+        double ch1_angle_mdeg = ch1_vdiff_uv / SENSOR_UV_PER_MDEG;
+        double ch2_angle_mdeg = ch2_vdiff_uv / SENSOR_UV_PER_MDEG;
+
+        double dt = (double)(now - last_report) / 1000000.0;
+
+        if (!lpf_initialized) {
+            ch1_vdiff_lpf_uv = (double)ch1_vdiff_uv;
+            ch2_vdiff_lpf_uv = (double)ch2_vdiff_uv;
+            lpf_initialized = 1;
+        } else {
+            double alpha = dt / (LPF_TAU_SECONDS + dt);
+            ch1_vdiff_lpf_uv += alpha * ((double)ch1_vdiff_uv - ch1_vdiff_lpf_uv);
+            ch2_vdiff_lpf_uv += alpha * ((double)ch2_vdiff_uv - ch2_vdiff_lpf_uv);
+        }
+
+        double ch1_lpf_mdeg = fit_angle_mdeg(ch1_vdiff_lpf_uv / SENSOR_UV_PER_MDEG);
+        double ch2_lpf_mdeg = fit_angle_mdeg(ch2_vdiff_lpf_uv / SENSOR_UV_PER_MDEG);
+        double ch1_lpf_mdeg_offset = ch1_lpf_mdeg + offset_ch1;
+        double ch2_lpf_mdeg_offset = ch2_lpf_mdeg + offset_ch2;
+        double elapsed_time_s = (double)(now - pwm_epoch) / 1000000.0;
+
+        int board_temp_mC = read_board_temp_mC();
+        if (board_temp_mC >= 0) {
+            if (!temp_lpf_initialized) {
+                board_temp_lpf_mC = (double)board_temp_mC;
+                temp_lpf_initialized = 1;
+            } else {
+                double alpha = dt / (LPF_TAU_SECONDS + dt);
+                board_temp_lpf_mC += alpha * ((double)board_temp_mC - board_temp_lpf_mC);
+            }
+        }
+
+        char console_message[640];
+        snprintf(console_message, sizeof(console_message),
+                 "%.3f,%d,%.1f,"
+                 "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
+                 "%lld,%lld,%ld,%.3f,%.3f,%.3f,"
+                 "%u,%u,%u,%u,%u,%u,%u,%u\n",
+                 elapsed_time_s, board_temp_mC,
+                 temp_lpf_initialized ? board_temp_lpf_mC : -1.0,
+                 (long long)ch1_high_avg, (long long)ch1_low_avg, (long)ch1_vdiff_uv,
+                 ch1_angle_mdeg, ch1_lpf_mdeg, ch1_lpf_mdeg_offset,
+                 (long long)ch2_high_avg, (long long)ch2_low_avg, (long)ch2_vdiff_uv,
+                 ch2_angle_mdeg, ch2_lpf_mdeg, ch2_lpf_mdeg_offset,
+                 channels[0].spike_edge_count, channels[0].spike_reject_count,
+                 channels[0].spike_fallback_count, ch1_accepted,
+                 channels[1].spike_edge_count, channels[1].spike_reject_count,
+                 channels[1].spike_fallback_count, ch2_accepted);
+
+        fputs(console_message, stdout);
+        fflush(stdout);
+
+        if (tcp_server_fd >= 0) {
+            /* TCP returns the current ~0.1 s RAW result (no LPF / fit / offset). */
+            service_tcp_clients(tcp_server_fd, tcp_clients,
+                                ch1_angle_mdeg, ch2_angle_mdeg,
+                                (double)ch1_vdiff_uv, (double)ch2_vdiff_uv);
+        }
+
+        fprintf(stderr,
+                "samples: CH1=%u acc=%u rej=%u | CH2=%u acc=%u rej=%u | "
+                "missed=%llu drdy_to=%llu stale=%llu rdata=%llu unpaired=%llu "
+                "mux_retry=%llu mux_reset=%llu\n",
+                ch1_count, ch1_accepted, channels[0].spike_reject_count,
+                ch2_count, ch2_accepted, channels[1].spike_reject_count,
+                (unsigned long long)missed_cycles,
+                (unsigned long long)dbg_drdy_timeout,
+                (unsigned long long)dbg_stale_level,
+                (unsigned long long)dbg_rdata_fail,
+                (unsigned long long)dbg_unpaired,
+                (unsigned long long)dbg_mux_retry,
+                (unsigned long long)dbg_mux_reset_fallback);
+
+        missed_cycles = 0;
+        reset_channel_average(&channels[0]);
+        reset_channel_average(&channels[1]);
+        last_report = now;
+        report_ready = 0;
+    }
+
+    for (int i = 0; i < TCP_MAX_CLIENTS; ++i)
+        close_tcp_client(&tcp_clients[i]);
+    if (tcp_server_fd >= 0)
+        close(tcp_server_fd);
+
+    return EXIT_SUCCESS;
+}
